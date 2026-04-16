@@ -282,29 +282,59 @@ def downscale(img: Image.Image, max_w: int = MODEL_MAX_W) -> tuple[Image.Image, 
 
 CLASSIFY_PROMPT = """\
 You are looking at a screenshot of a multiple-choice quiz.
-There is ONE question and FOUR answer options listed below it, numbered 1 to 4 from top to bottom.
+There is a question and between 2 and 4 answer options shown as buttons below it.
 
-Your job:
-1. Read the question carefully.
-2. Reason through each option.
-3. Return ONLY this JSON (no markdown, no extra text):
-{"answer": <1|2|3|4>, "rationale": "<brief reason why this answer is correct>"}
+Instructions:
+- Read the question.
+- Identify the correct answer button.
+- Count the buttons from the top: the topmost button is 1, next is 2, etc.
+- Output ONLY the following JSON. No markdown. No explanation outside the JSON.
 
-"answer" is the position number of the correct option counting from the top."""
+{"answer": <integer 1-4>, "rationale": "<one sentence>"}
+
+If you output anything other than that exact JSON your response will be rejected."""
 
 
 def parse_answer_response(raw: str) -> tuple[int, str]:
+    """
+    Multi-stage parser — handles JSON, partial JSON, and markdown prose fallbacks.
+    """
+    # Strip markdown code fences
     raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
+    raw = re.sub(r"```$",          "", raw, flags=re.MULTILINE).strip()
+
+    # 1. Try clean JSON parse
     try:
         data = json.loads(raw)
         return int(data["answer"]), str(data.get("rationale", "—"))
     except (json.JSONDecodeError, KeyError, ValueError):
-        m = re.search(r'"answer"\s*:\s*([1-4])', raw)
-        r = re.search(r'"rationale"\s*:\s*"([^"]+)"', raw)
+        pass
+
+    # 2. JSON anywhere inside the response
+    m = re.search(r'\{[^{}]*"answer"\s*:\s*([1-4])[^{}]*\}', raw)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            return int(data["answer"]), str(data.get("rationale", "—"))
+        except Exception:
+            pass
+
+    # 3. Pull answer number from common prose patterns
+    #    e.g. "answer": 1  /  Correct Answer: 1  /  Option 1  /  **1.**
+    patterns = [
+        r'"answer"\s*:\s*([1-4])',                              # json key
+        r'(?:correct\s+answer|answer\s+is)\D{0,10}([1-4])\b',  # "correct answer: 1"
+        r'\bOption\s+([1-4])\b',                                # "Option 1"
+        r'^\*{0,2}([1-4])[.\)]\s',                             # "1. text" at line start
+        r'\b([1-4])\s+is\s+(?:correct|the\s+answer)',          # "1 is correct"
+    ]
+    for pat in patterns:
+        m = re.search(pat, raw, re.IGNORECASE | re.MULTILINE)
         if m:
-            return int(m.group(1)), (r.group(1) if r else "—")
-        raise ValueError(f"Could not parse:\n{raw}")
+            rat_m = re.search(r'"rationale"\s*:\s*"([^"]+)"', raw)
+            return int(m.group(1)), (rat_m.group(1) if rat_m else "—")
+
+    raise ValueError(f"Could not extract answer number from model output:\n{raw}")
 
 
 def classify_answer_stream(
@@ -340,55 +370,93 @@ def classify_answer_stream(
 
 
 # ── Button detection ──────────────────────────────────────────────────────────
+#
+# Works for both layouts seen so far:
+#   • Centered quiz (buttons fill ~40-70% of screen width, horizontally centered)
+#   • Left-panel + right-answers layout
+#
+# Strategy:
+#   1. Scan full image width (skip thin edges + nav bar + taskbar)
+#   2. Find horizontal bands whose average luminosity differs from the background
+#   3. For each band, find the actual left/right extent of the "different" pixels
+#      so the X center is the true button center, not a fixed crop offset
+#   4. Accept 2-4 buttons (not hardcoded to 4)
+
+def _smooth(data: list[float], k: int = 7) -> list[float]:
+    out = []
+    for i in range(len(data)):
+        s, e = max(0, i-k), min(len(data), i+k+1)
+        out.append(sum(data[s:e]) / (e - s))
+    return out
+
 
 def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
     w, h = img.size
-    x0, y0, x1, y1 = int(w*.45), int(h*.15), int(w*.98), int(h*.90)
+
+    # Exclude: top nav bar (~7%), taskbar (~8%), thin side margins (~3%)
+    x0, y0 = int(w * .03), int(h * .07)
+    x1, y1 = int(w * .97), int(h * .92)
     crop = img.crop((x0, y0, x1, y1))
     cw, ch = crop.size
 
-    blurred = crop.filter(ImageFilter.GaussianBlur(radius=2))
+    blurred = crop.filter(ImageFilter.GaussianBlur(radius=3))
     gray    = blurred.convert("L")
     pixels  = gray.load()
 
-    step = max(1, cw // 64)
-    row_avg = []
-    for y in range(ch):
-        vals = [pixels[x, y] for x in range(0, cw, step)]
-        row_avg.append(sum(vals) / len(vals))
-
-    def smooth(data, k=7):
-        out = []
-        for i in range(len(data)):
-            s, e = max(0, i-k), min(len(data), i+k+1)
-            out.append(sum(data[s:e]) / (e - s))
-        return out
-
-    smoothed   = smooth(row_avg)
+    # Per-row average luminosity (sample every ~8px for speed)
+    step = max(1, cw // 120)
+    row_avg = [
+        sum(pixels[x, y] for x in range(0, cw, step)) / (cw // step)
+        for y in range(ch)
+    ]
+    smoothed   = _smooth(row_avg, k=6)
     global_avg = sum(smoothed) / len(smoothed)
+    # Adaptive threshold — at least 8, at most std-dev based
+    variance   = sum((v - global_avg)**2 for v in smoothed) / len(smoothed)
+    threshold  = max(8.0, variance**0.5 * 0.6)
 
-    in_band, band_start = False, 0
+    # Find bands where rows are brighter or darker than the background
+    in_band = False
+    band_start = 0
     bands: list[tuple[int, int]] = []
     for y, lum in enumerate(smoothed):
-        diff = abs(lum - global_avg) > 8
-        if diff and not in_band:
+        is_btn = abs(lum - global_avg) > threshold
+        if is_btn and not in_band:
             in_band, band_start = True, y
-        elif not diff and in_band:
+        elif not is_btn and in_band:
             in_band = False
-            if y - band_start >= 12:
+            if y - band_start >= 18:          # minimum plausible button height
                 bands.append((band_start, y))
-    if in_band and ch - band_start >= 12:
+    if in_band and ch - band_start >= 18:
         bands.append((band_start, ch))
 
+    # Keep 2–4 tallest bands, sorted top-to-bottom
     bands = sorted(
-        sorted(bands, key=lambda b: b[1]-b[0], reverse=True)[:4],
+        sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:4],
         key=lambda b: b[0],
     )
-    if len(bands) != 4:
+    if len(bands) < 2:
         return None
 
-    x_center = x0 + cw // 2
-    return [(x_center, y0 + (s+e)//2) for s, e in bands]
+    # For each band: find the horizontal extent of "button pixels" in that row
+    # so X is the true center of the button, not a fixed crop position.
+    results: list[tuple[int, int]] = []
+    for bs, be in bands:
+        mid_y = (bs + be) // 2
+        btn_cols = [
+            x for x in range(0, cw, step)
+            if abs(pixels[x, mid_y] - global_avg) > threshold
+        ]
+        if btn_cols:
+            left  = x0 + min(btn_cols)
+            right = x0 + max(btn_cols)
+            cx    = (left + right) // 2
+        else:
+            cx = w // 2          # fallback: screen centre
+        cy = y0 + (bs + be) // 2
+        results.append((cx, cy))
+
+    return results
 
 
 # ── Mouse ─────────────────────────────────────────────────────────────────────
@@ -775,8 +843,10 @@ class App(ctk.CTk):
             try:
                 phys_xy = detect_buttons(img)
                 if phys_xy:
-                    answer_num = max(1, min(4, answer_num))
+                    n = len(phys_xy)
+                    answer_num = max(1, min(n, answer_num))
                     px, py = phys_xy[answer_num - 1]
+                    self._syslog(f"DETECT  found {n} button(s), targeting #{answer_num}")
                 else:
                     px, py = None, None
             except Exception as e:
@@ -786,7 +856,7 @@ class App(ctk.CTk):
             self._stop_anim()
 
             if px is None:
-                self._syslog("WARN  could not detect 4 buttons — skipping", error=True)
+                self._syslog("WARN  no buttons detected — skipping", error=True)
                 continue
 
             # physical → absolute → logical
