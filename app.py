@@ -281,83 +281,102 @@ def downscale(img: Image.Image, max_w: int = MODEL_MAX_W) -> tuple[Image.Image, 
 # ── Vision (streaming so Stop works immediately) ──────────────────────────────
 
 CLASSIFY_PROMPT = """\
-You are looking at a screenshot of a multiple-choice quiz.
-There is a question and between 2 and 4 answer options shown as buttons below it.
+Look at this quiz screenshot carefully and determine the question type.
 
-Instructions:
-- Read the question.
-- Identify the correct answer button.
-- Count the buttons from the top: the topmost button is 1, next is 2, etc.
-- Output ONLY the following JSON. No markdown. No explanation outside the JSON.
+QUESTION TYPE A — MULTIPLE CHOICE:
+  There are 2-4 rectangular answer buttons stacked vertically with text inside.
+  They may be on the right half of the screen or centred.
 
-{"answer": <integer 1-4>, "rationale": "<one sentence>"}
+QUESTION TYPE B — TEXT INPUT:
+  There is a text field / input box where you must TYPE a numeric or short answer.
+  There is usually a Submit button nearby. No clickable answer buttons.
 
-If you output anything other than that exact JSON your response will be rejected."""
+STEP 1: Identify the type.
+STEP 2: Answer it.
+  - Multiple choice → which button number is correct? (1 = topmost, counting down)
+  - Text input → what exact value should be typed? (e.g. "12.77")
+
+Output ONLY valid JSON, no markdown, no extra text:
+  Multiple choice: {"type": "mc",   "answer": <1-4>,       "rationale": "<one sentence>"}
+  Text input:      {"type": "text", "answer": "<value>",   "rationale": "<one sentence>"}
+
+Your response will be rejected if it contains anything outside the JSON."""
 
 
-def parse_answer_response(raw: str) -> tuple[int, str]:
-    """
-    Multi-stage parser — handles JSON, partial JSON, and markdown prose fallbacks.
-    """
-    # Strip markdown code fences
+def _strip_fences(raw: str) -> str:
     raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"```$",          "", raw, flags=re.MULTILINE).strip()
+    return re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
 
-    # 1. Try clean JSON parse
+
+def parse_answer_response(raw: str) -> dict:
+    """
+    Returns {"type": "mc"|"text", "answer": int|str, "rationale": str}
+    Multi-stage parser handles JSON, partial JSON, and prose fallbacks.
+    """
+    raw = _strip_fences(raw)
+
+    # 1. Clean JSON
     try:
         data = json.loads(raw)
-        return int(data["answer"]), str(data.get("rationale", "—"))
+        qtype = str(data.get("type", "mc")).lower()
+        rat   = str(data.get("rationale", "—"))
+        if qtype == "text":
+            return {"type": "text", "answer": str(data["answer"]), "rationale": rat}
+        return {"type": "mc", "answer": int(data["answer"]), "rationale": rat}
     except (json.JSONDecodeError, KeyError, ValueError):
         pass
 
-    # 2. JSON anywhere inside the response
-    m = re.search(r'\{[^{}]*"answer"\s*:\s*([1-4])[^{}]*\}', raw)
+    # 2. JSON embedded in prose
+    m = re.search(r'\{[^{}]+\}', raw)
     if m:
         try:
             data = json.loads(m.group(0))
-            return int(data["answer"]), str(data.get("rationale", "—"))
+            qtype = str(data.get("type", "mc")).lower()
+            rat   = str(data.get("rationale", "—"))
+            if qtype == "text":
+                return {"type": "text", "answer": str(data["answer"]), "rationale": rat}
+            return {"type": "mc", "answer": int(data["answer"]), "rationale": rat}
         except Exception:
             pass
 
-    # 3. Pull answer number from common prose patterns
-    #    e.g. "answer": 1  /  Correct Answer: 1  /  Option 1  /  **1.**
+    # 3. Detect text-input type from prose
+    if re.search(r'"type"\s*:\s*"text"', raw, re.I):
+        ans_m = re.search(r'"answer"\s*:\s*"([^"]+)"', raw)
+        rat_m = re.search(r'"rationale"\s*:\s*"([^"]+)"', raw)
+        if ans_m:
+            return {"type": "text", "answer": ans_m.group(1),
+                    "rationale": rat_m.group(1) if rat_m else "—"}
+
+    # 4. Multiple-choice prose fallbacks
     patterns = [
-        r'"answer"\s*:\s*([1-4])',                              # json key
-        r'(?:correct\s+answer|answer\s+is)\D{0,10}([1-4])\b',  # "correct answer: 1"
-        r'\bOption\s+([1-4])\b',                                # "Option 1"
-        r'^\*{0,2}([1-4])[.\)]\s',                             # "1. text" at line start
-        r'\b([1-4])\s+is\s+(?:correct|the\s+answer)',          # "1 is correct"
+        r'"answer"\s*:\s*([1-4])',
+        r'(?:correct\s+answer|answer\s+is)\D{0,10}([1-4])\b',
+        r'\bOption\s+([1-4])\b',
+        r'^\*{0,2}([1-4])[.\)]\s',
+        r'\b([1-4])\s+is\s+(?:correct|the\s+answer)',
     ]
     for pat in patterns:
         m = re.search(pat, raw, re.IGNORECASE | re.MULTILINE)
         if m:
             rat_m = re.search(r'"rationale"\s*:\s*"([^"]+)"', raw)
-            return int(m.group(1)), (rat_m.group(1) if rat_m else "—")
+            return {"type": "mc", "answer": int(m.group(1)),
+                    "rationale": rat_m.group(1) if rat_m else "—"}
 
-    raise ValueError(f"Could not extract answer number from model output:\n{raw}")
+    raise ValueError(f"Could not parse model output:\n{raw}")
 
 
 def classify_answer_stream(
     img: Image.Image,
     stop_evt: threading.Event,
-    on_token,           # callback(str) — each streamed token
-) -> tuple[int, str]:
-    """
-    Streams tokens from the model so we can:
-      • Show live reasoning in the AI log
-      • Abort immediately when stop_evt fires
-    Raises InterruptedError if stopped mid-stream.
-    """
+    on_token,
+) -> dict:
+    """Streams response and returns parsed dict. Raises InterruptedError on stop."""
     small, _ = downscale(img)
     full = ""
-
     for chunk in ollama.chat(
         model=OLLAMA_MODEL,
-        messages=[{
-            "role": "user",
-            "content": CLASSIFY_PROMPT,
-            "images": [to_jpeg_b64(small)],
-        }],
+        messages=[{"role": "user", "content": CLASSIFY_PROMPT,
+                   "images": [to_jpeg_b64(small)]}],
         stream=True,
     ):
         if stop_evt.is_set():
@@ -365,8 +384,83 @@ def classify_answer_stream(
         token = chunk["message"]["content"]
         full += token
         on_token(token)
-
     return parse_answer_response(full)
+
+
+# ── Text input helpers ────────────────────────────────────────────────────────
+
+def _copy_to_clipboard(text: str):
+    """Push text to Windows clipboard via clip.exe (no extra deps)."""
+    subprocess.run("clip", input=text.encode("utf-16-le"),
+                   shell=True, check=True)
+
+
+def detect_input_field(img: Image.Image) -> tuple[int, int] | None:
+    """
+    Find a text input field — a thin (15-60px) horizontal band in the lower
+    portion of the screen, distinctly lighter or darker than the background.
+    """
+    w, h = img.size
+    x0, y0 = int(w * .05), int(h * .55)
+    x1, y1 = int(w * .95), int(h * .93)
+    crop = img.crop((x0, y0, x1, y1))
+    cw, ch = crop.size
+
+    gray    = crop.filter(ImageFilter.GaussianBlur(radius=2)).convert("L")
+    pixels  = gray.load()
+    step    = max(1, cw // 80)
+
+    row_avg = [
+        sum(pixels[x, y] for x in range(0, cw, step)) / max(1, cw // step)
+        for y in range(ch)
+    ]
+    smoothed   = _smooth(row_avg, k=3)
+    global_avg = sum(smoothed) / len(smoothed)
+    variance   = sum((v - global_avg)**2 for v in smoothed) / len(smoothed)
+    threshold  = max(6.0, variance**0.5 * 0.5)
+
+    min_h, max_h = 12, int(ch * 0.20)
+    in_band = False
+    band_start = 0
+    bands: list[tuple[int, int]] = []
+    for y, lum in enumerate(smoothed):
+        hit = abs(lum - global_avg) > threshold
+        if hit and not in_band:
+            in_band, band_start = True, y
+        elif not hit and in_band:
+            in_band = False
+            if min_h <= y - band_start <= max_h:
+                bands.append((band_start, y))
+    if not bands:
+        return None
+
+    bs, be = max(bands, key=lambda b: b[1] - b[0])
+    mid_y   = (bs + be) // 2
+    cols    = [x for x in range(0, cw, step)
+               if abs(pixels[x, mid_y] - global_avg) > threshold]
+    cx = x0 + (min(cols) + max(cols)) // 2 if cols else w // 2
+    return cx, y0 + (bs + be) // 2
+
+
+def handle_text_input(answer: str, field_xy: tuple[int, int],
+                      stop_evt: threading.Event, speed: float = 0.008):
+    """Click the input field, clear it, paste the answer, hit Enter."""
+    fx, fy = field_xy
+    human_click(fx, fy, stop_evt, speed=speed)
+    if stop_evt.is_set():
+        return
+    time.sleep(0.12)
+    # Select all existing text and replace with our answer
+    pydirectinput.keyDown("ctrl")
+    pydirectinput.press("a")
+    pydirectinput.keyUp("ctrl")
+    time.sleep(0.05)
+    _copy_to_clipboard(answer)
+    pydirectinput.keyDown("ctrl")
+    pydirectinput.press("v")
+    pydirectinput.keyUp("ctrl")
+    time.sleep(0.08)
+    pydirectinput.press("enter")
 
 
 # ── Button detection ──────────────────────────────────────────────────────────
@@ -393,9 +487,9 @@ def _smooth(data: list[float], k: int = 7) -> list[float]:
 def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
     w, h = img.size
 
-    # Scan from 30% down — question/passage cards are always above the buttons.
+    # Scan from 20% down — catches buttons that start high on the screen.
     # Skip taskbar (~8% from bottom) and thin side margins.
-    x0, y0 = int(w * .03), int(h * .30)
+    x0, y0 = int(w * .03), int(h * .20)
     x1, y1 = int(w * .97), int(h * .92)
     crop = img.crop((x0, y0, x1, y1))
     cw, ch = crop.size
@@ -459,6 +553,49 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
         else:
             cx = w // 2
         results.append((cx, y0 + (bs + be) // 2))
+
+    # Left-panel layout guard: if all detected centres are in the left half,
+    # the scan grabbed the reading passage instead of the right-side buttons.
+    # Re-run with x starting at 50% to isolate the answer column.
+    if results and all(cx < w * 0.50 for cx, _ in results):
+        x0b = int(w * .50)
+        crop_r = img.crop((x0b, y0, x1, y1)).filter(
+            ImageFilter.GaussianBlur(radius=3))
+        gray_r  = crop_r.convert("L")
+        pix_r   = gray_r.load()
+        cwr     = x1 - x0b
+        row_r   = [
+            sum(pix_r[x, y] for x in range(0, cwr, step)) / max(1, cwr // step)
+            for y in range(ch)
+        ]
+        sm_r    = _smooth(row_r, k=6)
+        gav_r   = sum(sm_r) / len(sm_r)
+        var_r   = sum((v - gav_r)**2 for v in sm_r) / len(sm_r)
+        thr_r   = max(8.0, var_r**0.5 * 0.6)
+        in_b, b_s = False, 0
+        bands_r: list[tuple[int, int]] = []
+        for y, lum in enumerate(sm_r):
+            hit = abs(lum - gav_r) > thr_r
+            if hit and not in_b:
+                in_b, b_s = True, y
+            elif not hit and in_b:
+                in_b = False
+                bh = y - b_s
+                if min_h <= bh <= max_h:
+                    bands_r.append((b_s, y))
+        if in_b and min_h <= ch - b_s <= max_h:
+            bands_r.append((b_s, ch))
+        bands_r = sorted(
+            sorted(bands_r, key=lambda b: b[1]-b[0], reverse=True)[:4],
+            key=lambda b: b[0])
+        if len(bands_r) >= 2:
+            results = []
+            for bs, be in bands_r:
+                mid_y = (bs + be) // 2
+                cols  = [x for x in range(0, cwr, step)
+                         if abs(pix_r[x, mid_y] - gav_r) > thr_r]
+                cx = x0b + (min(cols) + max(cols)) // 2 if cols else (x0b + x1) // 2
+                results.append((cx, y0 + (bs + be) // 2))
 
     return results
 
@@ -819,10 +956,8 @@ class App(ctk.CTk):
             self._start_anim("model")
 
             try:
-                answer_num, rationale = classify_answer_stream(
-                    img,
-                    self._stop_evt,
-                    on_token=self._stream_token,   # each token → AI log live
+                result = classify_answer_stream(
+                    img, self._stop_evt, on_token=self._stream_token,
                 )
             except InterruptedError:
                 self._stop_anim()
@@ -835,53 +970,77 @@ class App(ctk.CTk):
                 continue
 
             self._stop_anim()
-
             if self._stop_evt.is_set():
                 return
 
-            self._syslog(f"ANSWER  #{answer_num}  —  {rationale}")
+            qtype    = result["type"]
+            answer   = result["answer"]
+            rationale = result["rationale"]
+            self._syslog(f"TYPE  {qtype.upper()}  |  ANSWER  {answer}  —  {rationale}")
 
-            # ── Detect buttons ────────────────────────────────────────────────
-            self._syslog("DETECT  scanning for buttons…")
-            self._start_anim("detect")
-            try:
-                phys_xy = detect_buttons(img)
-                if phys_xy:
-                    n = len(phys_xy)
-                    answer_num = max(1, min(n, answer_num))
-                    px, py = phys_xy[answer_num - 1]
-                    self._syslog(f"DETECT  found {n} button(s), targeting #{answer_num}")
-                else:
-                    px, py = None, None
-            except Exception as e:
-                self._syslog(f"ERR  detect: {e}", error=True)
+            # ── Branch: multiple choice vs text input ─────────────────────────
+            if qtype == "text":
+                # ── Text input: find field, type answer, submit ───────────────
+                self._syslog(f"TEXT INPUT  typing: '{answer}'")
+                self._start_anim("detect")
+                field = detect_input_field(img)
                 self._stop_anim()
-                continue
-            self._stop_anim()
 
-            if px is None:
-                self._syslog("WARN  no buttons detected — skipping", error=True)
-                continue
+                if field is None:
+                    self._syslog("WARN  input field not found — skipping", error=True)
+                    continue
 
-            # physical → absolute → logical
-            abs_px = px + mon_info["left"]
-            abs_py = py + mon_info["top"]
-            log_x  = int(round(abs_px / dpi))
-            log_y  = int(round(abs_py / dpi))
+                fx = int(round((field[0] + mon_info["left"]) / dpi))
+                fy = int(round((field[1] + mon_info["top"])  / dpi))
+                self._syslog(f"FIELD  ({fx},{fy})  →  typing '{answer}'")
+                self._start_anim("click")
+                try:
+                    handle_text_input(str(answer), (fx, fy),
+                                      self._stop_evt, speed=self._speed.get())
+                except Exception as e:
+                    self._syslog(f"ERR  type: {e}", error=True)
+                finally:
+                    self._stop_anim()
 
-            self._syslog(f"PHYS ({abs_px},{abs_py})  →  CLICK ({log_x},{log_y})")
-
-            if self._stop_evt.is_set():
-                return
-
-            # ── Click ─────────────────────────────────────────────────────────
-            self._syslog("CLICK")
-            self._start_anim("click")
-            try:
-                human_click(log_x, log_y, self._stop_evt, speed=self._speed.get())
-            except Exception as e:
-                self._syslog(f"ERR  click: {e}", error=True)
+            else:
+                # ── Multiple choice: detect buttons, click correct one ─────────
+                self._syslog("DETECT  scanning for buttons…")
+                self._start_anim("detect")
+                try:
+                    phys_xy = detect_buttons(img)
+                    if phys_xy:
+                        n = len(phys_xy)
+                        answer_num = max(1, min(n, int(answer)))
+                        px, py = phys_xy[answer_num - 1]
+                        self._syslog(f"DETECT  found {n} button(s), targeting #{answer_num}")
+                    else:
+                        px, py = None, None
+                except Exception as e:
+                    self._syslog(f"ERR  detect: {e}", error=True)
+                    self._stop_anim()
+                    continue
                 self._stop_anim()
+
+                if px is None:
+                    self._syslog("WARN  no buttons detected — skipping", error=True)
+                    continue
+
+                abs_px = px + mon_info["left"]
+                abs_py = py + mon_info["top"]
+                log_x  = int(round(abs_px / dpi))
+                log_y  = int(round(abs_py / dpi))
+                self._syslog(f"PHYS ({abs_px},{abs_py})  →  CLICK ({log_x},{log_y})")
+
+                if self._stop_evt.is_set():
+                    return
+
+                self._syslog("CLICK")
+                self._start_anim("click")
+                try:
+                    human_click(log_x, log_y, self._stop_evt, speed=self._speed.get())
+                except Exception as e:
+                    self._syslog(f"ERR  click: {e}", error=True)
+                    self._stop_anim()
                 continue
             self._stop_anim()
 
