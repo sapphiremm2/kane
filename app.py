@@ -532,11 +532,20 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
         if min_h <= band_h <= max_h:
             bands.append((band_start, ch))
 
-    # Keep 2–4 bands, tallest first then sort top-to-bottom
-    bands = sorted(
-        sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:4],
-        key=lambda b: b[0],
-    )
+    # Keep up to 6 candidate bands (tallest first), sort top-to-bottom
+    candidates = sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:6]
+    candidates = sorted(candidates, key=lambda b: b[0])
+
+    # Consistency filter: real answer buttons have similar heights.
+    # Drop outlier bands whose height deviates > 60% from the median.
+    if len(candidates) >= 2:
+        heights = [b[1] - b[0] for b in candidates]
+        median_h = sorted(heights)[len(heights) // 2]
+        candidates = [b for b in candidates
+                      if abs((b[1]-b[0]) - median_h) / max(median_h, 1) <= 0.60]
+
+    # Keep 2–4
+    bands = candidates[:4]
     if len(bands) < 2:
         return None
 
@@ -1012,7 +1021,8 @@ class App(ctk.CTk):
                         n = len(phys_xy)
                         answer_num = max(1, min(n, int(answer)))
                         px, py = phys_xy[answer_num - 1]
-                        self._syslog(f"DETECT  found {n} button(s), targeting #{answer_num}")
+                        ys = ", ".join(str(y) for _, y in phys_xy)
+                        self._syslog(f"DETECT  {n} button(s) at y=[{ys}], targeting #{answer_num}")
                     else:
                         px, py = None, None
                 except Exception as e:
@@ -1040,9 +1050,8 @@ class App(ctk.CTk):
                     human_click(log_x, log_y, self._stop_evt, speed=self._speed.get())
                 except Exception as e:
                     self._syslog(f"ERR  click: {e}", error=True)
+                finally:
                     self._stop_anim()
-                continue
-            self._stop_anim()
 
             if self._stop_evt.is_set():
                 return
