@@ -25,7 +25,7 @@ import customtkinter as ctk
 import mss
 import ollama
 import pydirectinput
-from PIL import Image, ImageTk, ImageFilter
+from PIL import Image, ImageTk
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -281,26 +281,25 @@ def downscale(img: Image.Image, max_w: int = MODEL_MAX_W) -> tuple[Image.Image, 
 # ── Vision (streaming so Stop works immediately) ──────────────────────────────
 
 CLASSIFY_PROMPT = """\
-Look at this quiz screenshot carefully and determine the question type.
+You are looking at a quiz screenshot. Answer the question AND tell me exactly where to click.
 
-QUESTION TYPE A — MULTIPLE CHOICE:
-  There are 2-4 rectangular answer buttons stacked vertically with text inside.
-  They may be on the right half of the screen or centred.
+STEP 1 — Identify the question type:
+  MULTIPLE CHOICE: 2-4 rectangular answer buttons stacked vertically. Count them 1 (top) to 4 (bottom).
+  TEXT INPUT: A text box / input field where a value must be typed. No clickable answer buttons.
 
-QUESTION TYPE B — TEXT INPUT:
-  There is a text field / input box where you must TYPE a numeric or short answer.
-  There is usually a Submit button nearby. No clickable answer buttons.
+STEP 2 — Answer correctly.
+  Multiple choice: which button number (1-4) is the correct answer?
+  Text input: what exact value should be typed? (e.g. "42" or "3.14")
 
-STEP 1: Identify the type.
-STEP 2: Answer it.
-  - Multiple choice → which button number is correct? (1 = topmost, counting down)
-  - Text input → what exact value should be typed? (e.g. "12.77")
+STEP 3 — Identify the click target as a percentage of image size:
+  Multiple choice: give the CENTER of the CORRECT answer button.
+  Text input: give the CENTER of the text input field.
+  x_pct = 0 is the left edge, 100 is the right edge.
+  y_pct = 0 is the top edge, 100 is the bottom edge.
 
 Output ONLY valid JSON, no markdown, no extra text:
-  Multiple choice: {"type": "mc",   "answer": <1-4>,       "rationale": "<one sentence>"}
-  Text input:      {"type": "text", "answer": "<value>",   "rationale": "<one sentence>"}
-
-Your response will be rejected if it contains anything outside the JSON."""
+  Multiple choice: {"type": "mc",   "answer": <1-4>,     "x_pct": <0-100>, "y_pct": <0-100>, "rationale": "<one sentence>"}
+  Text input:      {"type": "text", "answer": "<value>", "x_pct": <0-100>, "y_pct": <0-100>, "rationale": "<one sentence>"}"""
 
 
 def _strip_fences(raw: str) -> str:
@@ -310,19 +309,38 @@ def _strip_fences(raw: str) -> str:
 
 def parse_answer_response(raw: str) -> dict:
     """
-    Returns {"type": "mc"|"text", "answer": int|str, "rationale": str}
+    Returns {"type": "mc"|"text", "answer": int|str,
+             "x_pct": float, "y_pct": float, "rationale": str}
     Multi-stage parser handles JSON, partial JSON, and prose fallbacks.
     """
     raw = _strip_fences(raw)
 
+    def _coords(data: dict) -> tuple[float, float]:
+        try:
+            x = max(0.0, min(100.0, float(data.get("x_pct", 50))))
+            y = max(0.0, min(100.0, float(data.get("y_pct", 50))))
+            return x, y
+        except (TypeError, ValueError):
+            return 50.0, 50.0
+
+    def _pct_from_prose(txt: str) -> tuple[float, float]:
+        xm = re.search(r'"x_pct"\s*:\s*([0-9]+(?:\.[0-9]+)?)', txt)
+        ym = re.search(r'"y_pct"\s*:\s*([0-9]+(?:\.[0-9]+)?)', txt)
+        x = max(0.0, min(100.0, float(xm.group(1)))) if xm else 50.0
+        y = max(0.0, min(100.0, float(ym.group(1)))) if ym else 50.0
+        return x, y
+
     # 1. Clean JSON
     try:
-        data = json.loads(raw)
+        data  = json.loads(raw)
         qtype = str(data.get("type", "mc")).lower()
         rat   = str(data.get("rationale", "—"))
+        xp, yp = _coords(data)
         if qtype == "text":
-            return {"type": "text", "answer": str(data["answer"]), "rationale": rat}
-        return {"type": "mc", "answer": int(data["answer"]), "rationale": rat}
+            return {"type": "text", "answer": str(data["answer"]),
+                    "x_pct": xp, "y_pct": yp, "rationale": rat}
+        return {"type": "mc", "answer": int(data["answer"]),
+                "x_pct": xp, "y_pct": yp, "rationale": rat}
     except (json.JSONDecodeError, KeyError, ValueError):
         pass
 
@@ -330,14 +348,20 @@ def parse_answer_response(raw: str) -> dict:
     m = re.search(r'\{[^{}]+\}', raw)
     if m:
         try:
-            data = json.loads(m.group(0))
+            data  = json.loads(m.group(0))
             qtype = str(data.get("type", "mc")).lower()
             rat   = str(data.get("rationale", "—"))
+            xp, yp = _coords(data)
             if qtype == "text":
-                return {"type": "text", "answer": str(data["answer"]), "rationale": rat}
-            return {"type": "mc", "answer": int(data["answer"]), "rationale": rat}
+                return {"type": "text", "answer": str(data["answer"]),
+                        "x_pct": xp, "y_pct": yp, "rationale": rat}
+            return {"type": "mc", "answer": int(data["answer"]),
+                    "x_pct": xp, "y_pct": yp, "rationale": rat}
         except Exception:
             pass
+
+    # Fall back: try to extract percentage coords from prose anyway
+    xp, yp = _pct_from_prose(raw)
 
     # 3. Detect text-input type from prose
     if re.search(r'"type"\s*:\s*"text"', raw, re.I):
@@ -345,6 +369,7 @@ def parse_answer_response(raw: str) -> dict:
         rat_m = re.search(r'"rationale"\s*:\s*"([^"]+)"', raw)
         if ans_m:
             return {"type": "text", "answer": ans_m.group(1),
+                    "x_pct": xp, "y_pct": yp,
                     "rationale": rat_m.group(1) if rat_m else "—"}
 
     # 4. Multiple-choice prose fallbacks
@@ -360,6 +385,7 @@ def parse_answer_response(raw: str) -> dict:
         if m:
             rat_m = re.search(r'"rationale"\s*:\s*"([^"]+)"', raw)
             return {"type": "mc", "answer": int(m.group(1)),
+                    "x_pct": xp, "y_pct": yp,
                     "rationale": rat_m.group(1) if rat_m else "—"}
 
     raise ValueError(f"Could not parse model output:\n{raw}")
@@ -395,53 +421,6 @@ def _copy_to_clipboard(text: str):
                    shell=True, check=True)
 
 
-def detect_input_field(img: Image.Image) -> tuple[int, int] | None:
-    """
-    Find a text input field — a thin (15-60px) horizontal band in the lower
-    portion of the screen, distinctly lighter or darker than the background.
-    """
-    w, h = img.size
-    x0, y0 = int(w * .05), int(h * .55)
-    x1, y1 = int(w * .95), int(h * .93)
-    crop = img.crop((x0, y0, x1, y1))
-    cw, ch = crop.size
-
-    gray    = crop.filter(ImageFilter.GaussianBlur(radius=2)).convert("L")
-    pixels  = gray.load()
-    step    = max(1, cw // 80)
-
-    row_avg = [
-        sum(pixels[x, y] for x in range(0, cw, step)) / max(1, cw // step)
-        for y in range(ch)
-    ]
-    smoothed   = _smooth(row_avg, k=3)
-    global_avg = sum(smoothed) / len(smoothed)
-    variance   = sum((v - global_avg)**2 for v in smoothed) / len(smoothed)
-    threshold  = max(6.0, variance**0.5 * 0.5)
-
-    min_h, max_h = 12, int(ch * 0.20)
-    in_band = False
-    band_start = 0
-    bands: list[tuple[int, int]] = []
-    for y, lum in enumerate(smoothed):
-        hit = abs(lum - global_avg) > threshold
-        if hit and not in_band:
-            in_band, band_start = True, y
-        elif not hit and in_band:
-            in_band = False
-            if min_h <= y - band_start <= max_h:
-                bands.append((band_start, y))
-    if not bands:
-        return None
-
-    bs, be = max(bands, key=lambda b: b[1] - b[0])
-    mid_y   = (bs + be) // 2
-    cols    = [x for x in range(0, cw, step)
-               if abs(pixels[x, mid_y] - global_avg) > threshold]
-    cx = x0 + (min(cols) + max(cols)) // 2 if cols else w // 2
-    return cx, y0 + (bs + be) // 2
-
-
 def handle_text_input(answer: str, field_xy: tuple[int, int],
                       stop_evt: threading.Event, speed: float = 0.008):
     """Click the input field, clear it, paste the answer, hit Enter."""
@@ -450,7 +429,6 @@ def handle_text_input(answer: str, field_xy: tuple[int, int],
     if stop_evt.is_set():
         return
     time.sleep(0.12)
-    # Select all existing text and replace with our answer
     pydirectinput.keyDown("ctrl")
     pydirectinput.press("a")
     pydirectinput.keyUp("ctrl")
@@ -461,152 +439,6 @@ def handle_text_input(answer: str, field_xy: tuple[int, int],
     pydirectinput.keyUp("ctrl")
     time.sleep(0.08)
     pydirectinput.press("enter")
-
-
-# ── Button detection ──────────────────────────────────────────────────────────
-#
-# Works for both layouts seen so far:
-#   • Centered quiz (buttons fill ~40-70% of screen width, horizontally centered)
-#   • Left-panel + right-answers layout
-#
-# Strategy:
-#   1. Scan full image width (skip thin edges + nav bar + taskbar)
-#   2. Find horizontal bands whose average luminosity differs from the background
-#   3. For each band, find the actual left/right extent of the "different" pixels
-#      so the X center is the true button center, not a fixed crop offset
-#   4. Accept 2-4 buttons (not hardcoded to 4)
-
-def _smooth(data: list[float], k: int = 7) -> list[float]:
-    out = []
-    for i in range(len(data)):
-        s, e = max(0, i-k), min(len(data), i+k+1)
-        out.append(sum(data[s:e]) / (e - s))
-    return out
-
-
-def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
-    w, h = img.size
-
-    # Scan from 20% down — catches buttons that start high on the screen.
-    # Skip taskbar (~8% from bottom) and thin side margins.
-    x0, y0 = int(w * .03), int(h * .20)
-    x1, y1 = int(w * .97), int(h * .92)
-    crop = img.crop((x0, y0, x1, y1))
-    cw, ch = crop.size
-
-    blurred = crop.filter(ImageFilter.GaussianBlur(radius=3))
-    gray    = blurred.convert("L")
-    pixels  = gray.load()
-
-    step = max(1, cw // 120)
-    row_avg = [
-        sum(pixels[x, y] for x in range(0, cw, step)) / max(1, cw // step)
-        for y in range(ch)
-    ]
-    smoothed   = _smooth(row_avg, k=6)
-    global_avg = sum(smoothed) / len(smoothed)
-    variance   = sum((v - global_avg)**2 for v in smoothed) / len(smoothed)
-    threshold  = max(8.0, variance**0.5 * 0.6)
-
-    # Button height constraints (as fraction of the cropped region height):
-    #   min: buttons are at least ~2% of crop height
-    #   max: buttons are at most ~18% of crop height — anything taller is a
-    #        question card, image, or reading passage, NOT a clickable button.
-    min_h = max(12, int(ch * .02))
-    max_h = int(ch * .18)
-
-    in_band = False
-    band_start = 0
-    bands: list[tuple[int, int]] = []
-    for y, lum in enumerate(smoothed):
-        is_btn = abs(lum - global_avg) > threshold
-        if is_btn and not in_band:
-            in_band, band_start = True, y
-        elif not is_btn and in_band:
-            in_band = False
-            band_h = y - band_start
-            if min_h <= band_h <= max_h:      # ← rejects question cards (too tall)
-                bands.append((band_start, y))
-    if in_band:
-        band_h = ch - band_start
-        if min_h <= band_h <= max_h:
-            bands.append((band_start, ch))
-
-    # Keep up to 6 candidate bands (tallest first), sort top-to-bottom
-    candidates = sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:6]
-    candidates = sorted(candidates, key=lambda b: b[0])
-
-    # Consistency filter: real answer buttons have similar heights.
-    # Drop outlier bands whose height deviates > 60% from the median.
-    if len(candidates) >= 2:
-        heights = [b[1] - b[0] for b in candidates]
-        median_h = sorted(heights)[len(heights) // 2]
-        candidates = [b for b in candidates
-                      if abs((b[1]-b[0]) - median_h) / max(median_h, 1) <= 0.60]
-
-    # Keep 2–4
-    bands = candidates[:4]
-    if len(bands) < 2:
-        return None
-
-    # For each band find the true horizontal centre of the button pixels
-    results: list[tuple[int, int]] = []
-    for bs, be in bands:
-        mid_y = (bs + be) // 2
-        btn_cols = [
-            x for x in range(0, cw, step)
-            if abs(pixels[x, mid_y] - global_avg) > threshold
-        ]
-        if btn_cols:
-            cx = x0 + (min(btn_cols) + max(btn_cols)) // 2
-        else:
-            cx = w // 2
-        results.append((cx, y0 + (bs + be) // 2))
-
-    # Left-panel layout guard: if all detected centres are in the left half,
-    # the scan grabbed the reading passage instead of the right-side buttons.
-    # Re-run with x starting at 50% to isolate the answer column.
-    if results and all(cx < w * 0.50 for cx, _ in results):
-        x0b = int(w * .50)
-        crop_r = img.crop((x0b, y0, x1, y1)).filter(
-            ImageFilter.GaussianBlur(radius=3))
-        gray_r  = crop_r.convert("L")
-        pix_r   = gray_r.load()
-        cwr     = x1 - x0b
-        row_r   = [
-            sum(pix_r[x, y] for x in range(0, cwr, step)) / max(1, cwr // step)
-            for y in range(ch)
-        ]
-        sm_r    = _smooth(row_r, k=6)
-        gav_r   = sum(sm_r) / len(sm_r)
-        var_r   = sum((v - gav_r)**2 for v in sm_r) / len(sm_r)
-        thr_r   = max(8.0, var_r**0.5 * 0.6)
-        in_b, b_s = False, 0
-        bands_r: list[tuple[int, int]] = []
-        for y, lum in enumerate(sm_r):
-            hit = abs(lum - gav_r) > thr_r
-            if hit and not in_b:
-                in_b, b_s = True, y
-            elif not hit and in_b:
-                in_b = False
-                bh = y - b_s
-                if min_h <= bh <= max_h:
-                    bands_r.append((b_s, y))
-        if in_b and min_h <= ch - b_s <= max_h:
-            bands_r.append((b_s, ch))
-        bands_r = sorted(
-            sorted(bands_r, key=lambda b: b[1]-b[0], reverse=True)[:4],
-            key=lambda b: b[0])
-        if len(bands_r) >= 2:
-            results = []
-            for bs, be in bands_r:
-                mid_y = (bs + be) // 2
-                cols  = [x for x in range(0, cwr, step)
-                         if abs(pix_r[x, mid_y] - gav_r) > thr_r]
-                cx = x0b + (min(cols) + max(cols)) // 2 if cols else (x0b + x1) // 2
-                results.append((cx, y0 + (bs + be) // 2))
-
-    return results
 
 
 # ── Mouse ─────────────────────────────────────────────────────────────────────
@@ -672,7 +504,7 @@ class App(ctk.CTk):
         # animation state
         self._spin_i    = 0
         self._anim_on   = False
-        self._anim_state   = "idle"   # idle | waiting | model | detect | click
+        self._anim_state   = "idle"   # idle | waiting | model | click
         self._anim_start   = 0.0
         self._anim_total   = 0.0
 
@@ -912,8 +744,6 @@ class App(ctk.CTk):
             txt     = f"  {s}  WAITING  [{bar}]  {rem:.0f}s"
         elif self._anim_state == "model":
             txt = f"  {s}  MODEL THINKING..."
-        elif self._anim_state == "detect":
-            txt = f"  {s}  SCANNING SCREEN FOR BUTTONS..."
         elif self._anim_state == "click":
             txt = f"  {s}  MOVING MOUSE..."
         else:
@@ -987,24 +817,25 @@ class App(ctk.CTk):
             rationale = result["rationale"]
             self._syslog(f"TYPE  {qtype.upper()}  |  ANSWER  {answer}  —  {rationale}")
 
+            # ── Convert model percentage coords → logical screen coords ─────────
+            x_pct = result.get("x_pct", 50.0)
+            y_pct = result.get("y_pct", 50.0)
+            img_w, img_h = img.size
+            px = int(round(img_w * x_pct / 100))
+            py = int(round(img_h * y_pct / 100))
+            log_x = int(round((px + mon_info["left"]) / dpi))
+            log_y = int(round((py + mon_info["top"])  / dpi))
+            self._syslog(f"TARGET  ({x_pct:.1f}%, {y_pct:.1f}%)  →  ({log_x},{log_y})")
+
+            if self._stop_evt.is_set():
+                return
+
             # ── Branch: multiple choice vs text input ─────────────────────────
             if qtype == "text":
-                # ── Text input: find field, type answer, submit ───────────────
-                self._syslog(f"TEXT INPUT  typing: '{answer}'")
-                self._start_anim("detect")
-                field = detect_input_field(img)
-                self._stop_anim()
-
-                if field is None:
-                    self._syslog("WARN  input field not found — skipping", error=True)
-                    continue
-
-                fx = int(round((field[0] + mon_info["left"]) / dpi))
-                fy = int(round((field[1] + mon_info["top"])  / dpi))
-                self._syslog(f"FIELD  ({fx},{fy})  →  typing '{answer}'")
+                self._syslog(f"TEXT INPUT  typing '{answer}'")
                 self._start_anim("click")
                 try:
-                    handle_text_input(str(answer), (fx, fy),
+                    handle_text_input(str(answer), (log_x, log_y),
                                       self._stop_evt, speed=self._speed.get())
                 except Exception as e:
                     self._syslog(f"ERR  type: {e}", error=True)
@@ -1012,38 +843,6 @@ class App(ctk.CTk):
                     self._stop_anim()
 
             else:
-                # ── Multiple choice: detect buttons, click correct one ─────────
-                self._syslog("DETECT  scanning for buttons…")
-                self._start_anim("detect")
-                try:
-                    phys_xy = detect_buttons(img)
-                    if phys_xy:
-                        n = len(phys_xy)
-                        answer_num = max(1, min(n, int(answer)))
-                        px, py = phys_xy[answer_num - 1]
-                        ys = ", ".join(str(y) for _, y in phys_xy)
-                        self._syslog(f"DETECT  {n} button(s) at y=[{ys}], targeting #{answer_num}")
-                    else:
-                        px, py = None, None
-                except Exception as e:
-                    self._syslog(f"ERR  detect: {e}", error=True)
-                    self._stop_anim()
-                    continue
-                self._stop_anim()
-
-                if px is None:
-                    self._syslog("WARN  no buttons detected — skipping", error=True)
-                    continue
-
-                abs_px = px + mon_info["left"]
-                abs_py = py + mon_info["top"]
-                log_x  = int(round(abs_px / dpi))
-                log_y  = int(round(abs_py / dpi))
-                self._syslog(f"PHYS ({abs_px},{abs_py})  →  CLICK ({log_x},{log_y})")
-
-                if self._stop_evt.is_set():
-                    return
-
                 self._syslog("CLICK")
                 self._start_anim("click")
                 try:
