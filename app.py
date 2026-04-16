@@ -10,10 +10,15 @@ import ctypes
 import io
 import json
 import math
+import os
 import random
 import re
+import subprocess
+import sys
+import tempfile
 import threading
 import time
+import urllib.request
 from datetime import datetime
 
 import customtkinter as ctk
@@ -24,6 +29,191 @@ from PIL import Image, ImageTk, ImageFilter
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
+
+# ── Version & update config ───────────────────────────────────────────────────
+VERSION      = "1.0.0"
+GITHUB_REPO  = "sapphiremm2/kane"
+RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+
+def _parse_version(tag: str) -> tuple[int, ...]:
+    """'v1.2.3' or '1.2.3' → (1, 2, 3)"""
+    return tuple(int(x) for x in tag.lstrip("v").split(".") if x.isdigit())
+
+
+def fetch_latest_release() -> dict | None:
+    """
+    Returns {"version": "1.2.0", "url": "<exe download url>", "notes": "..."}
+    or None if the check fails / no .exe asset found.
+    """
+    try:
+        req = urllib.request.Request(
+            RELEASES_URL,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "Kane-Updater"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read())
+
+        tag   = data.get("tag_name", "")
+        notes = data.get("body", "")
+        exe_url = next(
+            (a["browser_download_url"] for a in data.get("assets", [])
+             if a["name"].lower().endswith(".exe")),
+            None,
+        )
+        if not exe_url or not tag:
+            return None
+        return {"version": tag.lstrip("v"), "url": exe_url, "notes": notes}
+    except Exception:
+        return None
+
+
+def download_update(url: str, dest: str, progress_cb=None) -> bool:
+    """
+    Download url → dest. progress_cb(pct: float) called every chunk.
+    Returns True on success.
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Kane-Updater"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            done  = 0
+            chunk = 65536
+            with open(dest, "wb") as f:
+                while True:
+                    buf = resp.read(chunk)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    done += len(buf)
+                    if progress_cb and total:
+                        progress_cb(done / total)
+        return True
+    except Exception:
+        return False
+
+
+def launch_updater(new_exe: str, current_exe: str):
+    """
+    Writes a tiny .bat to %TEMP% that:
+      1. Waits for this process to exit
+      2. Replaces the old .exe with the new one
+      3. Relaunches Kane
+      4. Deletes itself
+    Then launches it detached and exits.
+    """
+    bat = os.path.join(tempfile.gettempdir(), "kane_update.bat")
+    with open(bat, "w") as f:
+        f.write(
+            f'@echo off\n'
+            f':wait\n'
+            f'tasklist /FI "PID eq {os.getpid()}" 2>NUL | find /I "{os.getpid()}" >NUL\n'
+            f'if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)\n'
+            f'move /y "{new_exe}" "{current_exe}"\n'
+            f'start "" "{current_exe}"\n'
+            f'del "%~f0"\n'
+        )
+    subprocess.Popen(["cmd", "/c", bat],
+                     creationflags=subprocess.CREATE_NO_WINDOW |
+                                   subprocess.DETACHED_PROCESS)
+    sys.exit(0)
+
+
+# ── Update dialog ─────────────────────────────────────────────────────────────
+
+class UpdateDialog(ctk.CTkToplevel):
+    def __init__(self, parent, release: dict):
+        super().__init__(parent)
+        self.title("Update Available")
+        self.geometry("480x280")
+        self.resizable(False, False)
+        self.configure(fg_color=SURFACE)
+        self.grab_set()
+        self.lift()
+
+        self._release = release
+        self._accepted = False
+
+        # Running as bundled .exe?
+        self._frozen = getattr(sys, "frozen", False)
+
+        ctk.CTkLabel(self, text="UPDATE AVAILABLE", font=("Courier New",13,"bold"),
+                     text_color=ACCENT).pack(pady=(22,4))
+        ctk.CTkLabel(self,
+                     text=f"  v{VERSION}  →  v{release['version']}  ",
+                     font=MONO, text_color=CREAM).pack()
+
+        notes_box = ctk.CTkTextbox(self, height=80, font=MONO_S,
+                                   fg_color="#000", text_color=DIM2,
+                                   corner_radius=0, border_width=0)
+        notes_box.pack(fill="x", padx=20, pady=12)
+        notes_box.insert("end", release["notes"] or "No release notes.")
+        notes_box.configure(state="disabled")
+
+        # Progress bar (hidden until download starts)
+        self._prog = ctk.CTkProgressBar(self, height=6, corner_radius=0,
+                                        fg_color=BORDER, progress_color=ACCENT)
+        self._prog.set(0)
+
+        self._info_lbl = ctk.CTkLabel(self, text="", font=MONO_S, text_color=DIM2)
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(pady=(0, 18))
+
+        if not self._frozen:
+            # Running from source — can't self-replace, just link to release
+            ctk.CTkLabel(self,
+                         text="Run from source: update via  git pull",
+                         font=MONO_S, text_color=DIM2).pack(pady=(0,8))
+            ctk.CTkButton(btn_row, text="[ CLOSE ]", width=120, height=30,
+                          font=MONO, fg_color="transparent", corner_radius=0,
+                          border_width=1, border_color=BORDER, text_color=DIM2,
+                          command=self.destroy).pack()
+            return
+
+        self._update_btn = ctk.CTkButton(
+            btn_row, text="[ UPDATE NOW ]", width=140, height=30,
+            font=MONO, fg_color="transparent", corner_radius=0,
+            border_width=1, border_color=ACCENT, text_color=ACCENT,
+            command=self._start_download,
+        )
+        self._update_btn.pack(side="left", padx=8)
+
+        ctk.CTkButton(
+            btn_row, text="[ SKIP ]", width=90, height=30,
+            font=MONO, fg_color="transparent", corner_radius=0,
+            border_width=1, border_color=BORDER, text_color=DIM2,
+            command=self.destroy,
+        ).pack(side="left", padx=8)
+
+    def _start_download(self):
+        self._update_btn.configure(state="disabled", text="DOWNLOADING...")
+        self._prog.pack(fill="x", padx=20, pady=(0, 4))
+        self._info_lbl.pack()
+
+        threading.Thread(target=self._download_worker, daemon=True).start()
+
+    def _download_worker(self):
+        current_exe = sys.executable
+        tmp = current_exe + ".update.exe"
+
+        def progress(pct):
+            self.after(0, self._prog.set, pct)
+            self.after(0, self._info_lbl.configure,
+                       {"text": f"  {pct*100:.0f}%  downloading…"})
+
+        ok = download_update(self._release["url"], tmp, progress)
+
+        if ok:
+            self.after(0, self._info_lbl.configure,
+                       {"text": "  Installing — app will restart…"})
+            self.after(800, lambda: launch_updater(tmp, current_exe))
+        else:
+            self.after(0, self._info_lbl.configure,
+                       {"text": "  Download failed. Try again later."})
+            self.after(0, self._update_btn.configure,
+                       {"state": "normal", "text": "[ RETRY ]"})
 
 # ── Palette ──────────────────────────────────────────────────────────────────
 BG       = "#0f0f0f"
@@ -270,6 +460,8 @@ class App(ctk.CTk):
 
         self._build()
         self._refresh_monitors()
+        # Check for updates in background so startup isn't blocked
+        threading.Thread(target=self._check_update, daemon=True).start()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Build UI
@@ -385,7 +577,7 @@ class App(ctk.CTk):
         foot = ctk.CTkFrame(self, fg_color=SURFACE, height=24, corner_radius=0)
         foot.pack(fill="x", side="bottom")
         foot.pack_propagate(False)
-        ctk.CTkLabel(foot, text="  OLLAMA  ·  LLAMA 3.2 VISION  ·  LOCAL",
+        ctk.CTkLabel(foot, text=f"  OLLAMA  ·  LLAMA 3.2 VISION  ·  LOCAL  ·  v{VERSION}",
                      font=MONO_S, text_color=DIM).pack(side="left")
 
     def _log_panel(self, parent, title: str, txt_color: str,
@@ -454,6 +646,16 @@ class App(ctk.CTk):
         if self._thread:
             self._thread.join()
         self.after(0, self._idle_ui)
+
+    def _check_update(self):
+        """Runs in background thread at startup."""
+        release = fetch_latest_release()
+        if release is None:
+            return
+        latest  = _parse_version(release["version"])
+        current = _parse_version(VERSION)
+        if latest > current:
+            self.after(0, lambda: UpdateDialog(self, release))
 
     def _idle_ui(self):
         self._btn.configure(text="[ START ]", border_color=ACCENT,
