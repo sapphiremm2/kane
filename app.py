@@ -393,8 +393,9 @@ def _smooth(data: list[float], k: int = 7) -> list[float]:
 def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
     w, h = img.size
 
-    # Exclude: top nav bar (~7%), taskbar (~8%), thin side margins (~3%)
-    x0, y0 = int(w * .03), int(h * .07)
+    # Scan from 30% down — question/passage cards are always above the buttons.
+    # Skip taskbar (~8% from bottom) and thin side margins.
+    x0, y0 = int(w * .03), int(h * .30)
     x1, y1 = int(w * .97), int(h * .92)
     crop = img.crop((x0, y0, x1, y1))
     cw, ch = crop.size
@@ -403,19 +404,23 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
     gray    = blurred.convert("L")
     pixels  = gray.load()
 
-    # Per-row average luminosity (sample every ~8px for speed)
     step = max(1, cw // 120)
     row_avg = [
-        sum(pixels[x, y] for x in range(0, cw, step)) / (cw // step)
+        sum(pixels[x, y] for x in range(0, cw, step)) / max(1, cw // step)
         for y in range(ch)
     ]
     smoothed   = _smooth(row_avg, k=6)
     global_avg = sum(smoothed) / len(smoothed)
-    # Adaptive threshold — at least 8, at most std-dev based
     variance   = sum((v - global_avg)**2 for v in smoothed) / len(smoothed)
     threshold  = max(8.0, variance**0.5 * 0.6)
 
-    # Find bands where rows are brighter or darker than the background
+    # Button height constraints (as fraction of the cropped region height):
+    #   min: buttons are at least ~2% of crop height
+    #   max: buttons are at most ~18% of crop height — anything taller is a
+    #        question card, image, or reading passage, NOT a clickable button.
+    min_h = max(12, int(ch * .02))
+    max_h = int(ch * .18)
+
     in_band = False
     band_start = 0
     bands: list[tuple[int, int]] = []
@@ -425,12 +430,15 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
             in_band, band_start = True, y
         elif not is_btn and in_band:
             in_band = False
-            if y - band_start >= 18:          # minimum plausible button height
+            band_h = y - band_start
+            if min_h <= band_h <= max_h:      # ← rejects question cards (too tall)
                 bands.append((band_start, y))
-    if in_band and ch - band_start >= 18:
-        bands.append((band_start, ch))
+    if in_band:
+        band_h = ch - band_start
+        if min_h <= band_h <= max_h:
+            bands.append((band_start, ch))
 
-    # Keep 2–4 tallest bands, sorted top-to-bottom
+    # Keep 2–4 bands, tallest first then sort top-to-bottom
     bands = sorted(
         sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:4],
         key=lambda b: b[0],
@@ -438,8 +446,7 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
     if len(bands) < 2:
         return None
 
-    # For each band: find the horizontal extent of "button pixels" in that row
-    # so X is the true center of the button, not a fixed crop position.
+    # For each band find the true horizontal centre of the button pixels
     results: list[tuple[int, int]] = []
     for bs, be in bands:
         mid_y = (bs + be) // 2
@@ -448,13 +455,10 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
             if abs(pixels[x, mid_y] - global_avg) > threshold
         ]
         if btn_cols:
-            left  = x0 + min(btn_cols)
-            right = x0 + max(btn_cols)
-            cx    = (left + right) // 2
+            cx = x0 + (min(btn_cols) + max(btn_cols)) // 2
         else:
-            cx = w // 2          # fallback: screen centre
-        cy = y0 + (bs + be) // 2
-        results.append((cx, cy))
+            cx = w // 2
+        results.append((cx, y0 + (bs + be) // 2))
 
     return results
 
