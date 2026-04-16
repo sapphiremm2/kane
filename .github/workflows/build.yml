@@ -1,0 +1,35 @@
+name: Build Windows EXE
+
+on:
+  release:
+    types: [created]   # triggers when you publish a GitHub release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build EXE
+        run: >
+          pyinstaller
+          --noconsole
+          --onefile
+          --collect-all customtkinter
+          --name Kane
+          app.py
+
+      - name: Upload EXE to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Kane.exe
