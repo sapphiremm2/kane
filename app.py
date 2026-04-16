@@ -1,5 +1,10 @@
 """
-app.py  —  AI Answer Bot
+app.py  —  Kane  |  AI Answer Bot
+----------------------------------
+Strategy change: model now returns answer NUMBER (1-4), not coordinates.
+PIL scans the screenshot to detect actual button positions.
+DPI scaling is handled automatically.
+
 Dependencies:
     pip install customtkinter mss pillow ollama pydirectinput
 """
@@ -19,66 +24,64 @@ import customtkinter as ctk
 import mss
 import ollama
 import pydirectinput
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageFilter
 
 ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+ctk.set_default_color_theme("dark-blue")
 
-# ── Colours ────────────────────────────────────────────────────────────────
-BG       = "#0e1117"
-PANEL    = "#161b22"
-BORDER   = "#30363d"
-ACCENT   = "#238636"
-ACCENT_H = "#2ea043"
-STOP_C   = "#b91c1c"
-STOP_H   = "#dc2626"
-TXT      = "#e6edf3"
-TXT_DIM  = "#8b949e"
-LOG_BG   = "#0d1117"
-LOG_TXT  = "#3fb950"
+# ── Palette (aino-inspired: sharp, monospace, near-black + cream) ──────────
+BG       = "#0f0f0f"
+SURFACE  = "#151515"
+SURFACE2 = "#1c1c1c"
+BORDER   = "#2e2e2e"
+CREAM    = "#f0efe8"
+DIM      = "#555555"
+ACCENT   = "#d4ff00"   # electric yellow-green
+GREEN    = "#00e676"
+RED      = "#ff1744"
+ORANGE   = "#ff9100"
+LOG_TXT  = "#39d353"   # GitHub-contribution green
 
-OLLAMA_MODEL  = "llama3.2-vision"
-MODEL_MAX_W   = 960   # downscale to this width before sending — keeps tokens low
+MONO  = ("Courier New", 11)
+MONO_S = ("Courier New", 10)
+MONO_L = ("Courier New", 13, "bold")
+SANS  = ("Segoe UI", 10)
+
+OLLAMA_MODEL = "llama3.2-vision"
+MODEL_MAX_W  = 1024
 
 
-# ── Screen capture ──────────────────────────────────────────────────────────
+# ── DPI ─────────────────────────────────────────────────────────────────────
+
+def get_dpi_scale(mon_idx: int = 1) -> float:
+    logical  = ctypes.windll.user32.GetSystemMetrics(0)
+    with mss.mss() as sct:
+        physical = sct.monitors[mon_idx]["width"]
+    return (physical / logical) if logical else 1.0
+
+
+# ── Screen capture ───────────────────────────────────────────────────────────
 
 def list_monitors() -> list[dict]:
-    """Return mss monitor dicts (index 0 = all screens, skip it)."""
     with mss.mss() as sct:
-        return sct.monitors[1:]   # [1] = primary, [2]+ = additional
+        return sct.monitors[1:]
 
 
-def capture_screen(monitor_idx: int) -> tuple[Image.Image, dict]:
-    """Capture monitor at 1-based mss index. Returns (image, monitor_dict)."""
+def capture_screen(mon_idx: int) -> tuple[Image.Image, dict]:
     with mss.mss() as sct:
-        mon = sct.monitors[monitor_idx]
+        mon = sct.monitors[mon_idx]
         raw = sct.grab(mon)
         img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
     return img, mon
 
 
-def get_dpi_scale(monitor_mss_idx: int = 1) -> float:
-    """
-    Physical pixels (mss) ÷ logical pixels (pydirectinput / Win32).
-    e.g. 150% Windows scaling → 1.5, 200% → 2.0, 100% → 1.0.
-    We compare GetSystemMetrics (logical) to the mss monitor width (physical).
-    """
-    logical_w = ctypes.windll.user32.GetSystemMetrics(0)   # SM_CXSCREEN
-    with mss.mss() as sct:
-        physical_w = sct.monitors[monitor_mss_idx]["width"]
-    return (physical_w / logical_w) if logical_w > 0 else 1.0
-
-
-def image_to_base64(img: Image.Image) -> str:
+def to_jpeg_b64(img: Image.Image) -> str:
     buf = io.BytesIO()
-    # JPEG at q=85 is ~10× smaller than PNG — dramatically faster inference
-    img.save(buf, format="JPEG", quality=85)
+    img.save(buf, format="JPEG", quality=82)
     return base64.b64encode(buf.getvalue()).decode()
 
 
 def downscale(img: Image.Image, max_w: int = MODEL_MAX_W) -> tuple[Image.Image, float]:
-    """Shrink image so the model gets fewer tokens. Returns (img, scale)."""
     w, h = img.size
     if w <= max_w:
         return img, 1.0
@@ -86,362 +89,423 @@ def downscale(img: Image.Image, max_w: int = MODEL_MAX_W) -> tuple[Image.Image, 
     return img.resize((max_w, int(h * scale)), Image.LANCZOS), scale
 
 
-# ── Vision model ────────────────────────────────────────────────────────────
+# ── Vision: ask ONLY for answer number ──────────────────────────────────────
+#
+# Asking for pixel coordinates was unreliable — the model hallucinated them.
+# Instead we ask for a simple classification (1-4) which is a task vision
+# models handle well, then we detect button positions ourselves with PIL.
 
-PROMPT = """\
-You are looking at a screenshot of an e-learning quiz.
+CLASSIFY_PROMPT = """\
+You are looking at a screenshot of a multiple-choice quiz.
 
-Layout description:
-- There may be a reading passage or image on the LEFT side of the screen — IGNORE that area entirely.
-- On the RIGHT side there is a question followed by FOUR answer choices.
-- Each answer choice is a dark rounded-rectangle button with a small circular radio indicator on its left edge and short text inside it (e.g. "a prototype", "a slogan").
+The quiz has ONE question and FOUR answer options listed below it, \
+numbered 1 to 4 from top to bottom.
 
-Your task:
-1. Read the question text.
-2. Decide which of the four answer buttons is correct.
-3. Return the pixel coordinates of the CENTER of that button.
+Your job:
+1. Read the question.
+2. Decide which answer is correct.
+3. Return ONLY this JSON (no markdown, no extra text):
+{"answer": <1|2|3|4>, "rationale": "<brief reason>"}
 
-Rules:
-- Only target the clickable answer buttons — NOT the passage text, NOT images, NOT the question text itself.
-- x and y must be real pixel positions inside the button as it appears in this image.
-- Do NOT copy or invent numbers. Look at the image and measure carefully.
-
-Respond with ONLY this JSON (no markdown fences, no extra text):
-{"rationale": "<brief reason>", "coordinates": {"x": <integer>, "y": <integer>}}"""
+"answer" is the position number of the correct option counting from the top. \
+Do not guess — reason from the question and answer text."""
 
 
-def ask_vision_model(img: Image.Image) -> tuple[str, int, int]:
-    """
-    Downscales the image, queries the model, then scales coordinates back up.
-    Returns (rationale, x, y) relative to the original full-res image.
-    """
-    small, scale = downscale(img)
-
-    response = ollama.chat(
+def classify_answer(img: Image.Image) -> tuple[int, str]:
+    """Returns (answer_number 1-4, rationale)."""
+    small, _ = downscale(img)
+    resp = ollama.chat(
         model=OLLAMA_MODEL,
-        messages=[{"role": "user", "content": PROMPT, "images": [image_to_base64(small)]}],
+        messages=[{"role": "user", "content": CLASSIFY_PROMPT,
+                   "images": [to_jpeg_b64(small)]}],
     )
-    raw = response["message"]["content"].strip()
+    raw = resp["message"]["content"].strip()
     raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"```$",          "", raw, flags=re.MULTILINE).strip()
+    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
 
     try:
-        data      = json.loads(raw)
-        rationale = str(data.get("rationale", "—"))
-        coords    = data["coordinates"]
-        rx, ry    = int(coords["x"]), int(coords["y"])
-    except (json.JSONDecodeError, KeyError):
-        rat = re.search(r'"rationale"\s*:\s*"([^"]+)"', raw)
-        xm  = re.search(r'"x"\s*:\s*(\d+)', raw)
-        ym  = re.search(r'"y"\s*:\s*(\d+)', raw)
-        if xm and ym:
-            rationale = rat.group(1) if rat else "—"
-            rx, ry    = int(xm.group(1)), int(ym.group(1))
-        else:
-            raise ValueError(f"Could not parse model output:\n{raw}")
-
-    # Scale back to original image resolution
-    if scale != 1.0:
-        rx = int(round(rx / scale))
-        ry = int(round(ry / scale))
-
-    return rationale, rx, ry
+        data = json.loads(raw)
+        return int(data["answer"]), str(data.get("rationale", "—"))
+    except (json.JSONDecodeError, KeyError, ValueError):
+        m = re.search(r'"answer"\s*:\s*([1-4])', raw)
+        r = re.search(r'"rationale"\s*:\s*"([^"]+)"', raw)
+        if m:
+            return int(m.group(1)), (r.group(1) if r else "—")
+        raise ValueError(f"Could not parse answer number from:\n{raw}")
 
 
-# ── Mouse movement ──────────────────────────────────────────────────────────
+# ── Button detection (PIL) ───────────────────────────────────────────────────
+#
+# Scans the right portion of the screenshot for 4 horizontal button bands.
+# Works by computing row-level luminosity variance:
+#   - Inside a button: low variance (uniform background color)
+#   - Between buttons / background: higher variance or different luminosity
+
+def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
+    """
+    Returns a list of 4 (x, y) centers in top-to-bottom order,
+    or None if detection fails.
+    """
+    w, h = img.size
+
+    # The answer buttons are in the right portion of the screen.
+    # Crop to right 55%, skip top 15% (nav/header) and bottom 10%.
+    x0 = int(w * 0.45)
+    y0 = int(h * 0.15)
+    x1 = int(w * 0.98)
+    y1 = int(h * 0.90)
+
+    crop = img.crop((x0, y0, x1, y1))
+    cw, ch = crop.size
+
+    # Slight blur to reduce noise before analysis
+    blurred = crop.filter(ImageFilter.GaussianBlur(radius=2))
+    gray    = blurred.convert("L")
+    pixels  = gray.load()
+
+    # Build per-row average luminosity (sample every 4 px for speed)
+    step = max(1, cw // 64)
+    row_avg = []
+    for y in range(ch):
+        vals = [pixels[x, y] for x in range(0, cw, step)]
+        row_avg.append(sum(vals) / len(vals))
+
+    # Smooth with a 7-row rolling mean
+    def smooth(data, k=7):
+        out = []
+        for i in range(len(data)):
+            s = max(0, i - k)
+            e = min(len(data), i + k + 1)
+            out.append(sum(data[s:e]) / (e - s))
+        return out
+
+    smoothed = smooth(row_avg)
+    global_avg = sum(smoothed) / len(smoothed)
+
+    # Detect "button bands": rows that are meaningfully brighter OR darker
+    # than the overall average (the quiz background is one solid color,
+    # buttons have a different shade).
+    threshold = 8
+    in_band = False
+    band_start = 0
+    bands: list[tuple[int, int]] = []
+
+    for y, lum in enumerate(smoothed):
+        is_button = abs(lum - global_avg) > threshold
+        if is_button and not in_band:
+            in_band, band_start = True, y
+        elif not is_button and in_band:
+            in_band = False
+            if y - band_start >= 12:         # min height filter
+                bands.append((band_start, y))
+
+    if in_band and ch - band_start >= 12:
+        bands.append((band_start, ch))
+
+    # Keep the 4 tallest bands, then sort by Y
+    bands = sorted(
+        sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:4],
+        key=lambda b: b[0],
+    )
+
+    if len(bands) != 4:
+        return None
+
+    x_center = x0 + cw // 2
+    return [(x_center, y0 + (s + e) // 2) for s, e in bands]
+
+
+def find_click_target(img: Image.Image, answer_num: int) -> tuple[int, int] | None:
+    """
+    Combine PIL detection + answer number to get the click coordinate.
+    Falls back to None if detection can't find 4 buttons.
+    """
+    buttons = detect_buttons(img)
+    if buttons and 1 <= answer_num <= 4:
+        return buttons[answer_num - 1]
+    return None
+
+
+# ── Mouse movement ───────────────────────────────────────────────────────────
 
 def _bezier(p0, p1, p2, p3, t):
     u = 1 - t
     return u**3*p0 + 3*u**2*t*p1 + 3*u*t**2*p2 + t**3*p3
 
 
-def move_mouse_curved(tx: int, ty: int, steps: int = 60, base_delay: float = 0.008):
+def curved_move(tx: int, ty: int, steps: int = 55, delay: float = 0.008):
     class _PT(ctypes.Structure):
         _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
     pt = _PT()
     ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
     sx, sy = pt.x, pt.y
-
     dx, dy = tx - sx, ty - sy
-    dist   = math.hypot(dx, dy) or 1
-    ps     = random.uniform(0.2, 0.5) * dist * random.choice([-1, 1])
+    dist = math.hypot(dx, dy) or 1
+    ps = random.uniform(0.2, 0.45) * dist * random.choice([-1, 1])
     mx, my = (sx + tx) / 2, (sy + ty) / 2
-
-    cp1x = sx + dx*random.uniform(0.15,0.35) + (-dy/dist)*ps*random.uniform(0.5,1.0)
-    cp1y = sy + dy*random.uniform(0.15,0.35) + ( dx/dist)*ps*random.uniform(0.5,1.0)
-    cp2x = mx + dx*random.uniform(0.10,0.25) + (-dy/dist)*ps*random.uniform(0.3,0.7)
-    cp2y = my + dy*random.uniform(0.10,0.25) + ( dx/dist)*ps*random.uniform(0.3,0.7)
-
+    cp1x = sx + dx*random.uniform(.15,.35) + (-dy/dist)*ps*random.uniform(.5,1)
+    cp1y = sy + dy*random.uniform(.15,.35) + ( dx/dist)*ps*random.uniform(.5,1)
+    cp2x = mx + dx*random.uniform(.10,.25) + (-dy/dist)*ps*random.uniform(.3,.7)
+    cp2y = my + dy*random.uniform(.10,.25) + ( dx/dist)*ps*random.uniform(.3,.7)
     for i in range(1, steps + 1):
-        t  = i / steps
+        t = i / steps
         te = t*t*(3 - 2*t)
         px = int(round(_bezier(sx, cp1x, cp2x, tx, te) + random.randint(-2, 2)))
         py = int(round(_bezier(sy, cp1y, cp2y, ty, te) + random.randint(-2, 2)))
         pydirectinput.moveTo(px, py)
-        time.sleep(base_delay / (1 + 1.5*math.sin(math.pi*t)))
-
+        time.sleep(delay / (1 + 1.5*math.sin(math.pi*t)))
     pydirectinput.moveTo(tx, ty)
 
 
 def human_click(x: int, y: int, speed: float = 0.008):
-    move_mouse_curved(x, y, base_delay=speed)
-    time.sleep(random.uniform(0.05, 0.18))
+    curved_move(x, y, delay=speed)
+    time.sleep(random.uniform(0.04, 0.15))
     pydirectinput.click(x, y)
 
 
-# ── GUI ─────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# GUI
+# ════════════════════════════════════════════════════════════════════════════
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("AI Answer Bot")
-        self.geometry("900x640")
-        self.minsize(860, 580)
+        self.title("KANE")
+        self.geometry("960x620")
+        self.minsize(860, 540)
         self.configure(fg_color=BG)
 
         self._running  = False
         self._stop_evt = threading.Event()
         self._thread   = None
         self._cycle    = 0
-        self._monitors = list_monitors()   # list of mss dicts
+        self._monitors = list_monitors()
 
-        self._build_ui()
+        self._build()
         self._refresh_monitors()
 
-    # ── Build ───────────────────────────────────────────────────────────────
+    # ── Layout ──────────────────────────────────────────────────────────────
 
-    def _build_ui(self):
-        # ── Top bar ──────────────────────────────────────────────────────
-        topbar = ctk.CTkFrame(self, fg_color=PANEL, height=52, corner_radius=0)
-        topbar.pack(fill="x", side="top")
-        topbar.pack_propagate(False)
+    def _build(self):
+        # ── Header bar ───────────────────────────────────────────────────
+        header = ctk.CTkFrame(self, fg_color=SURFACE, height=48, corner_radius=0)
+        header.pack(fill="x")
+        header.pack_propagate(False)
 
-        ctk.CTkLabel(topbar, text="  AI Answer Bot",
-                     font=("Segoe UI", 15, "bold"), text_color=TXT,
-                     image=None).pack(side="left", padx=16, pady=0)
+        ctk.CTkLabel(header, text="KANE", font=("Courier New", 14, "bold"),
+                     text_color=CREAM).pack(side="left", padx=20)
+
+        ctk.CTkLabel(header, text="/ AI ANSWER BOT", font=MONO,
+                     text_color=DIM).pack(side="left", padx=0)
 
         # status pill
-        self._status_frame = ctk.CTkFrame(topbar, fg_color="#1c2128", corner_radius=20)
-        self._status_frame.pack(side="left", padx=8)
-        self._led = ctk.CTkLabel(self._status_frame, text="●",
-                                  font=("Segoe UI", 13), text_color="#444",
-                                  width=18)
-        self._led.pack(side="left", padx=(10,2), pady=6)
-        self._status_lbl = ctk.CTkLabel(self._status_frame, text="Idle",
-                                         font=("Segoe UI", 11), text_color=TXT_DIM,
-                                         width=64)
-        self._status_lbl.pack(side="left", padx=(0,10), pady=6)
-
-        self._toggle_btn = ctk.CTkButton(
-            topbar, text="▶  Start", width=110, height=34,
-            font=("Segoe UI", 12, "bold"),
-            fg_color=ACCENT, hover_color=ACCENT_H, corner_radius=8,
-            command=self._toggle,
-        )
-        self._toggle_btn.pack(side="right", padx=16)
+        pill = ctk.CTkFrame(header, fg_color=SURFACE2, corner_radius=0,
+                             border_width=1, border_color=BORDER)
+        pill.pack(side="left", padx=16)
+        self._led = ctk.CTkLabel(pill, text="●", font=("Courier New", 11),
+                                  text_color=DIM, width=16)
+        self._led.pack(side="left", padx=(10, 4), pady=7)
+        self._status_lbl = ctk.CTkLabel(pill, text="IDLE", font=MONO_S,
+                                         text_color=DIM, width=72)
+        self._status_lbl.pack(side="left", padx=(0, 10), pady=7)
 
         # cycle counter
-        self._cycle_lbl = ctk.CTkLabel(topbar, text="Cycle: 0",
-                                        font=("Segoe UI", 11), text_color=TXT_DIM)
-        self._cycle_lbl.pack(side="right", padx=4)
+        self._cycle_lbl = ctk.CTkLabel(header, text="CYC: 000",
+                                        font=MONO_S, text_color=DIM)
+        self._cycle_lbl.pack(side="right", padx=20)
+
+        # start/stop
+        self._btn = ctk.CTkButton(
+            header, text="[ START ]", width=100, height=32,
+            font=MONO, fg_color="transparent", hover_color=SURFACE2,
+            border_width=1, border_color=ACCENT, text_color=ACCENT,
+            corner_radius=0, command=self._toggle,
+        )
+        self._btn.pack(side="right", padx=(0, 8))
 
         # ── Body ─────────────────────────────────────────────────────────
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=12, pady=(8, 0))
+        body = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        body.pack(fill="both", expand=True)
 
-        # Left: log
-        log_frame = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=10)
-        log_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        # Left: log ───────────────────────────────────────────────────────
+        log_frame = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=0,
+                                  border_width=1, border_color=BORDER)
+        log_frame.pack(side="left", fill="both", expand=True,
+                       padx=(8, 4), pady=8)
 
-        ctk.CTkLabel(log_frame, text="Reasoning Log",
-                     font=("Segoe UI", 11, "bold"), text_color=TXT_DIM,
-                     anchor="w").pack(fill="x", padx=14, pady=(10, 4))
+        log_head = ctk.CTkFrame(log_frame, fg_color=SURFACE2,
+                                 height=28, corner_radius=0)
+        log_head.pack(fill="x")
+        log_head.pack_propagate(False)
+        ctk.CTkLabel(log_head, text="  REASONING LOG", font=MONO_S,
+                     text_color=DIM, anchor="w").pack(side="left")
 
         self._log_box = ctk.CTkTextbox(
-            log_frame,
-            font=("Consolas", 11),
-            fg_color=LOG_BG, text_color=LOG_TXT,
+            log_frame, font=MONO,
+            fg_color="#000000", text_color=LOG_TXT,
             scrollbar_button_color=BORDER,
-            wrap="word", state="disabled", corner_radius=8,
+            wrap="word", state="disabled", corner_radius=0,
+            border_width=0,
         )
-        self._log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._log_box.pack(fill="both", expand=True)
 
-        # Right: preview + settings
-        right = ctk.CTkFrame(body, fg_color=BG, width=270)
-        right.pack(side="right", fill="y")
+        # Right panel ─────────────────────────────────────────────────────
+        right = ctk.CTkFrame(body, fg_color=BG, width=286, corner_radius=0)
+        right.pack(side="right", fill="y", padx=(4, 8), pady=8)
         right.pack_propagate(False)
 
-        # Preview card
-        prev_card = ctk.CTkFrame(right, fg_color=PANEL, corner_radius=10)
-        prev_card.pack(fill="x", pady=(0, 8))
+        # Preview
+        prev = ctk.CTkFrame(right, fg_color=SURFACE, corner_radius=0,
+                             border_width=1, border_color=BORDER)
+        prev.pack(fill="x", pady=(0, 6))
 
-        ctk.CTkLabel(prev_card, text="Last Screenshot",
-                     font=("Segoe UI", 11, "bold"), text_color=TXT_DIM,
-                     anchor="w").pack(fill="x", padx=14, pady=(10, 6))
+        ph = ctk.CTkFrame(prev, fg_color=SURFACE2, height=28, corner_radius=0)
+        ph.pack(fill="x")
+        ph.pack_propagate(False)
+        ctk.CTkLabel(ph, text="  LAST CAPTURE", font=MONO_S,
+                     text_color=DIM, anchor="w").pack(side="left")
 
-        self._preview_lbl = ctk.CTkLabel(
-            prev_card, text="No capture yet",
-            fg_color="#0d1117", width=246, height=155,
-            corner_radius=8, text_color=TXT_DIM,
-            font=("Segoe UI", 10),
+        self._preview = ctk.CTkLabel(
+            prev, text="—", fg_color="#000000",
+            width=268, height=162, corner_radius=0,
+            font=MONO_S, text_color=DIM,
         )
-        self._preview_lbl.pack(padx=12, pady=(0, 8))
+        self._preview.pack(padx=8, pady=(6, 4))
 
-        self._target_lbl = ctk.CTkLabel(prev_card, text="Target: —",
-                                         font=("Consolas", 11), text_color="#7c8cff")
-        self._target_lbl.pack(pady=(0, 10))
+        self._target_lbl = ctk.CTkLabel(
+            prev, text="TARGET  —", font=MONO_S, text_color=ACCENT,
+            anchor="w",
+        )
+        self._target_lbl.pack(fill="x", padx=10, pady=(0, 8))
 
         # Settings card
-        cfg_card = ctk.CTkFrame(right, fg_color=PANEL, corner_radius=10)
-        cfg_card.pack(fill="x")
+        cfg = ctk.CTkFrame(right, fg_color=SURFACE, corner_radius=0,
+                           border_width=1, border_color=BORDER)
+        cfg.pack(fill="x")
 
-        ctk.CTkLabel(cfg_card, text="Settings",
-                     font=("Segoe UI", 11, "bold"), text_color=TXT_DIM,
-                     anchor="w").pack(fill="x", padx=14, pady=(10, 8))
+        ch = ctk.CTkFrame(cfg, fg_color=SURFACE2, height=28, corner_radius=0)
+        ch.pack(fill="x")
+        ch.pack_propagate(False)
+        ctk.CTkLabel(ch, text="  SETTINGS", font=MONO_S,
+                     text_color=DIM, anchor="w").pack(side="left")
 
-        # Monitor selector
-        self._build_setting_row(cfg_card, "Display")
-        self._monitor_var = ctk.StringVar(value="Monitor 1")
-        self._monitor_menu = ctk.CTkOptionMenu(
-            cfg_card, variable=self._monitor_var,
-            values=["Monitor 1"],
-            fg_color="#1c2128", button_color=BORDER,
-            button_hover_color="#444c56", text_color=TXT,
-            font=("Segoe UI", 11), corner_radius=6,
+        # monitor selector
+        self._mk("DISPLAY", cfg)
+        self._monitor_var = ctk.StringVar(value="MON 1")
+        self._mon_menu = ctk.CTkOptionMenu(
+            cfg, variable=self._monitor_var, values=["MON 1"],
+            fg_color=SURFACE2, button_color=BORDER,
+            button_hover_color=SURFACE, text_color=CREAM,
+            font=MONO_S, corner_radius=0, width=268,
             command=lambda _: None,
         )
-        self._monitor_menu.pack(fill="x", padx=12, pady=(0, 10))
+        self._mon_menu.pack(padx=8, pady=(0, 8))
 
-        # Delay slider
-        self._build_setting_row(cfg_card, "Reading delay (s)")
-        self._delay_min = ctk.IntVar(value=15)
-        self._delay_max = ctk.IntVar(value=45)
+        # delay
+        self._mk("DELAY MIN / MAX (s)", cfg)
+        dr = ctk.CTkFrame(cfg, fg_color="transparent")
+        dr.pack(fill="x", padx=8, pady=(0, 8))
+        self._dmin = ctk.IntVar(value=15)
+        self._dmax = ctk.IntVar(value=45)
+        self._dmin_l = ctk.CTkLabel(dr, text="15", width=24, font=MONO_S, text_color=CREAM)
+        self._dmax_l = ctk.CTkLabel(dr, text="45", width=24, font=MONO_S, text_color=CREAM)
+        ctk.CTkSlider(dr, from_=1, to=120, variable=self._dmin, width=96,
+                       button_color=ACCENT, progress_color=ACCENT,
+                       command=lambda v: (self._dmin.set(int(v)),
+                                          self._dmin_l.configure(text=str(int(v))))
+                       ).pack(side="left", padx=(0, 4))
+        self._dmin_l.pack(side="left", padx=(0, 8))
+        ctk.CTkSlider(dr, from_=1, to=120, variable=self._dmax, width=96,
+                       button_color=ACCENT, progress_color=ACCENT,
+                       command=lambda v: (self._dmax.set(int(v)),
+                                          self._dmax_l.configure(text=str(int(v))))
+                       ).pack(side="left", padx=(0, 4))
+        self._dmax_l.pack(side="left")
 
-        delay_row = ctk.CTkFrame(cfg_card, fg_color="transparent")
-        delay_row.pack(fill="x", padx=12, pady=(0, 8))
+        # speed
+        self._mk("MOUSE SPEED", cfg)
+        sr = ctk.CTkFrame(cfg, fg_color="transparent")
+        sr.pack(fill="x", padx=8, pady=(0, 12))
+        self._speed = ctk.DoubleVar(value=0.008)
+        self._speed_l = ctk.CTkLabel(sr, text="0.008", width=44,
+                                      font=MONO_S, text_color=CREAM)
+        ctk.CTkSlider(sr, from_=0.002, to=0.030, number_of_steps=140,
+                       variable=self._speed, button_color=ACCENT,
+                       progress_color=ACCENT,
+                       command=lambda v: self._speed_l.configure(
+                           text=f"{v:.3f}")
+                       ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._speed_l.pack(side="left")
 
-        ctk.CTkLabel(delay_row, text="Min", font=("Segoe UI", 10),
-                     text_color=TXT_DIM, width=26).pack(side="left")
-        ctk.CTkSlider(delay_row, from_=1, to=120, number_of_steps=119,
-                       variable=self._delay_min, width=70,
-                       button_color=ACCENT, progress_color=ACCENT
-                       ).pack(side="left", padx=4)
-        self._dmin_lbl = ctk.CTkLabel(delay_row, text="15s", width=28,
-                                       font=("Segoe UI", 10), text_color=TXT)
-        self._dmin_lbl.pack(side="left")
+        # ── Footer ────────────────────────────────────────────────────────
+        foot = ctk.CTkFrame(self, fg_color=SURFACE, height=26, corner_radius=0)
+        foot.pack(fill="x", side="bottom")
+        foot.pack_propagate(False)
+        ctk.CTkLabel(foot, text="  OLLAMA  ·  LLAMA 3.2 VISION  ·  LOCAL",
+                     font=MONO_S, text_color=DIM).pack(side="left")
 
-        ctk.CTkLabel(delay_row, text="Max", font=("Segoe UI", 10),
-                     text_color=TXT_DIM, width=30).pack(side="left", padx=(6,0))
-        ctk.CTkSlider(delay_row, from_=1, to=120, number_of_steps=119,
-                       variable=self._delay_max, width=70,
-                       button_color=ACCENT, progress_color=ACCENT
-                       ).pack(side="left", padx=4)
-        self._dmax_lbl = ctk.CTkLabel(delay_row, text="45s", width=28,
-                                       font=("Segoe UI", 10), text_color=TXT)
-        self._dmax_lbl.pack(side="left")
-
-        self._delay_min.trace_add("write", lambda *_: self._dmin_lbl.configure(
-            text=f"{self._delay_min.get()}s"))
-        self._delay_max.trace_add("write", lambda *_: self._dmax_lbl.configure(
-            text=f"{self._delay_max.get()}s"))
-
-        # Mouse speed slider
-        self._build_setting_row(cfg_card, "Mouse speed")
-        spd_row = ctk.CTkFrame(cfg_card, fg_color="transparent")
-        spd_row.pack(fill="x", padx=12, pady=(0, 14))
-
-        self._speed_var = ctk.DoubleVar(value=0.008)
-        ctk.CTkSlider(spd_row, from_=0.002, to=0.030, number_of_steps=140,
-                       variable=self._speed_var,
-                       button_color=ACCENT, progress_color=ACCENT
-                       ).pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self._spd_lbl = ctk.CTkLabel(spd_row, text="0.008", width=40,
-                                      font=("Consolas", 10), text_color=TXT)
-        self._spd_lbl.pack(side="left")
-        self._speed_var.trace_add("write", lambda *_: self._spd_lbl.configure(
-            text=f"{self._speed_var.get():.3f}"))
-
-        # ── Bottom bar ────────────────────────────────────────────────────
-        btm = ctk.CTkFrame(self, fg_color=PANEL, height=28, corner_radius=0)
-        btm.pack(fill="x", side="bottom")
-        btm.pack_propagate(False)
-        ctk.CTkLabel(btm, text="Ollama  ·  llama3.2-vision  ·  local",
-                     font=("Segoe UI", 9), text_color=TXT_DIM
-                     ).pack(side="left", padx=12)
-
-    def _build_setting_row(self, parent, label: str):
-        ctk.CTkLabel(parent, text=label,
-                     font=("Segoe UI", 10), text_color=TXT_DIM,
-                     anchor="w").pack(fill="x", padx=14, pady=(2, 2))
+    def _mk(self, label: str, parent):
+        ctk.CTkLabel(parent, text=f"  {label}", font=MONO_S,
+                     text_color=DIM, anchor="w").pack(fill="x", pady=(6, 2))
 
     # ── Monitor helpers ──────────────────────────────────────────────────────
 
     def _refresh_monitors(self):
         self._monitors = list_monitors()
-        labels = [f"Monitor {i+1}  ({m['width']}×{m['height']})"
+        labels = [f"MON {i+1}  {m['width']}×{m['height']}"
                   for i, m in enumerate(self._monitors)]
-        self._monitor_menu.configure(values=labels)
+        self._mon_menu.configure(values=labels or ["MON 1"])
         if labels:
             self._monitor_var.set(labels[0])
 
-    def _selected_monitor_idx(self) -> int:
-        """Returns 1-based mss index for the selected monitor."""
-        label = self._monitor_var.get()
+    def _mon_idx(self) -> int:
         try:
-            n = int(label.split()[1]) - 1   # 0-based list index
-            return n + 1                     # mss is 1-based
+            return int(self._monitor_var.get().split()[1])
         except (IndexError, ValueError):
             return 1
 
-    # ── Start / Stop ─────────────────────────────────────────────────────────
+    # ── Start / stop ─────────────────────────────────────────────────────────
 
     def _toggle(self):
         if self._running:
-            self._stop()
+            self._running = False
+            self._stop_evt.set()
+            self._set_status("STOP…", ORANGE)
+            self._btn.configure(state="disabled")
+            threading.Thread(target=self._await_stop, daemon=True).start()
         else:
-            self._start()
-
-    def _start(self):
-        self._running = True
-        self._stop_evt.clear()
-        self._set_status("Running", "#2ecc71")
-        self._toggle_btn.configure(text="■  Stop",
-                                    fg_color=STOP_C, hover_color=STOP_H)
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _stop(self):
-        self._running = False
-        self._stop_evt.set()
-        self._set_status("Stopping…", "#f39c12")
-        self._toggle_btn.configure(state="disabled")
-        threading.Thread(target=self._await_stop, daemon=True).start()
+            self._running = True
+            self._stop_evt.clear()
+            self._set_status("RUN", GREEN)
+            self._btn.configure(text="[ STOP  ]", border_color=RED,
+                                 text_color=RED)
+            self._thread = threading.Thread(target=self._worker, daemon=True)
+            self._thread.start()
 
     def _await_stop(self):
         if self._thread:
             self._thread.join()
-        self.after(0, self._idle_ui)
+        self.after(0, self._idle)
 
-    def _idle_ui(self):
-        self._toggle_btn.configure(text="▶  Start",
-                                    fg_color=ACCENT, hover_color=ACCENT_H,
-                                    state="normal")
-        self._set_status("Idle", "#444")
+    def _idle(self):
+        self._btn.configure(text="[ START ]", border_color=ACCENT,
+                             text_color=ACCENT, state="normal")
+        self._set_status("IDLE", DIM)
 
-    # ── Worker thread ────────────────────────────────────────────────────────
+    # ── Worker ────────────────────────────────────────────────────────────────
 
     def _worker(self):
         while not self._stop_evt.is_set():
             self._cycle += 1
             self.after(0, self._cycle_lbl.configure,
-                       {"text": f"Cycle: {self._cycle}"})
+                       {"text": f"CYC: {self._cycle:03d}"})
 
-            # Interruptible reading delay
-            delay = random.uniform(self._delay_min.get(), self._delay_max.get())
-            self._log(f"━━━  Cycle {self._cycle}  ━━━")
-            self._log(f"Waiting {delay:.1f}s before acting…")
-            deadline = time.monotonic() + delay
-            while time.monotonic() < deadline:
+            # Reading delay (interruptible)
+            delay = random.uniform(self._dmin.get(), self._dmax.get())
+            self._log(f"━━━ CYCLE {self._cycle:03d} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            self._log(f"WAIT  {delay:.1f}s")
+            end = time.monotonic() + delay
+            while time.monotonic() < end:
                 if self._stop_evt.is_set():
                     return
                 time.sleep(0.1)
@@ -450,59 +514,69 @@ class App(ctk.CTk):
                 return
 
             # Capture
-            mon_idx = self._selected_monitor_idx()
-            self._log(f"Capturing monitor {mon_idx}…")
+            mon = self._mon_idx()
+            self._log(f"CAPTURE  monitor {mon}")
             try:
-                img, mon = capture_screen(mon_idx)
-            except Exception as exc:
-                self._log(f"[ERROR] Capture failed: {exc}")
+                img, mon_info = capture_screen(mon)
+            except Exception as e:
+                self._log(f"ERR  capture: {e}")
                 continue
 
             self._update_preview(img)
+            dpi = get_dpi_scale(mon)
+            self._log(f"DPI scale: {dpi:.2f}×   image: {img.size[0]}×{img.size[1]}")
 
-            # Vision
-            self._log("Querying Llama 3.2 Vision…")
+            # Classify
+            self._log("MODEL  classifying answer…")
             try:
-                rationale, rel_x, rel_y = ask_vision_model(img)
-            except Exception as exc:
-                self._log(f"[ERROR] Vision model: {exc}")
+                answer_num, rationale = classify_answer(img)
+            except Exception as e:
+                self._log(f"ERR  model: {e}")
                 continue
 
-            # Physical pixel coords (image-relative → absolute physical)
-            phys_x = rel_x + mon["left"]
-            phys_y = rel_y + mon["top"]
+            self._log(f"ANSWER  #{answer_num}  —  {rationale}")
 
-            # Convert physical → logical pixels (Windows DPI scaling)
-            # mss captures at physical resolution; pydirectinput uses logical coords.
-            # e.g. 150% scaling: divide by 1.5 so mouse lands in the right place.
-            dpi    = get_dpi_scale(mon_idx)
-            log_x  = int(round(phys_x / dpi))
-            log_y  = int(round(phys_y / dpi))
+            if self._stop_evt.is_set():
+                return
 
-            self._log(f"Rationale: {rationale}")
-            self._log(f"Physical: ({phys_x}, {phys_y})  DPI scale: {dpi:.2f}×  →  Click: ({log_x}, {log_y})")
+            # Detect button positions with PIL
+            self._log("DETECT  scanning for buttons…")
+            phys_xy = find_click_target(img, answer_num)
+
+            if phys_xy is None:
+                self._log("WARN  button detection failed — skipping click")
+                continue
+
+            phys_x, phys_y = phys_xy
+
+            # Add monitor offset, then divide by DPI scale → logical coords
+            abs_phys_x = phys_x + mon_info["left"]
+            abs_phys_y = phys_y + mon_info["top"]
+            log_x = int(round(abs_phys_x / dpi))
+            log_y = int(round(abs_phys_y / dpi))
+
+            self._log(f"PHYS ({abs_phys_x},{abs_phys_y})  →  CLICK ({log_x},{log_y})")
             self.after(0, self._target_lbl.configure,
-                       {"text": f"Click: ({log_x}, {log_y})  [{dpi:.2f}×]"})
+                       {"text": f"TARGET  ({log_x}, {log_y})"})
 
             if self._stop_evt.is_set():
                 return
 
             # Click
-            self._log("Moving mouse and clicking…")
+            self._log("CLICK")
             try:
-                human_click(log_x, log_y, speed=self._speed_var.get())
-            except Exception as exc:
-                self._log(f"[ERROR] Click: {exc}")
+                human_click(log_x, log_y, speed=self._speed.get())
+            except Exception as e:
+                self._log(f"ERR  click: {e}")
                 continue
 
-            self._log(f"Clicked ✓")
+            self._log("OK ✓")
 
-    # ── UI thread helpers ────────────────────────────────────────────────────
+    # ── UI helpers ────────────────────────────────────────────────────────────
 
     def _log(self, msg: str):
-        ts   = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}\n"
-        self.after(0, self._append_log, line)
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.after(0, self._append_log, f"[{ts}] {msg}\n")
 
     def _append_log(self, line: str):
         self._log_box.configure(state="normal")
@@ -516,13 +590,13 @@ class App(ctk.CTk):
 
     def _update_preview(self, img: Image.Image):
         thumb = img.copy()
-        thumb.thumbnail((246, 155), Image.LANCZOS)
+        thumb.thumbnail((268, 162), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(thumb)
         self.after(0, self._set_preview, tk_img)
 
     def _set_preview(self, tk_img):
-        self._preview_lbl._tk_image = tk_img
-        self._preview_lbl.configure(image=tk_img, text="")
+        self._preview._tk_image = tk_img
+        self._preview.configure(image=tk_img, text="")
 
 
 if __name__ == "__main__":
