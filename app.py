@@ -350,6 +350,7 @@ def parse_answer_response(raw: str) -> dict:
     # 4. Multiple-choice prose fallbacks
     patterns = [
         r'"answer"\s*:\s*([1-4])',
+        r'\*{0,2}[Aa]nswer\*{0,2}\s*:\s*([1-4])',      # *Answer*: 2  or  Answer: 2
         r'(?:correct\s+answer|answer\s+is)\D{0,10}([1-4])\b',
         r'\bOption\s+([1-4])\b',
         r'^\*{0,2}([1-4])[.\)]\s',
@@ -501,18 +502,35 @@ def _scan_for_buttons(
     """
     Run the full luminosity scan on a crop and return (cx, cy) list in
     *original image* coordinates, or None if no good group found.
+
+    Two-pass: first with a normal threshold, then with a looser one if the
+    first pass found fewer than 3 bands (catches subtle low-contrast buttons).
+    The spacing-consistency filter rejects false positives from both passes.
     """
     row_avg    = _row_avgs(pixels, cw, ch, step)
     smoothed   = _smooth(row_avg, k=6)
     global_avg = sum(smoothed) / len(smoothed)
     variance   = sum((v - global_avg) ** 2 for v in smoothed) / len(smoothed)
-    threshold  = max(8.0, variance ** 0.5 * 0.6)
+    std        = variance ** 0.5
 
     min_h = max(12, int(ch * .02))
     max_h = int(ch * .18)
 
-    bands = _find_bands(smoothed, global_avg, threshold, min_h, max_h)
+    # Pass 1 — normal sensitivity
+    thr1  = max(8.0, std * 0.55)
+    bands = _find_bands(smoothed, global_avg, thr1, min_h, max_h)
     group = _best_button_group(bands)
+
+    # Pass 2 — lower threshold if we didn't find enough
+    if (group is None or len(group) < 3) and std > 0:
+        thr2   = max(5.0, std * 0.35)
+        bands2 = _find_bands(smoothed, global_avg, thr2, min_h, max_h)
+        group2 = _best_button_group(bands2)
+        # Accept pass-2 result only if it found more buttons
+        if group2 is not None and (group is None or len(group2) > len(group)):
+            group  = group2
+            thr1   = thr2   # use same threshold for col detection below
+
     if group is None:
         return None
 
@@ -520,7 +538,7 @@ def _scan_for_buttons(
     for bs, be in group:
         mid_y    = (bs + be) // 2
         btn_cols = [x for x in range(0, cw, step)
-                    if abs(pixels[x, mid_y] - global_avg) > threshold]
+                    if abs(pixels[x, mid_y] - global_avg) > thr1]
         cx = x_offset + ((min(btn_cols) + max(btn_cols)) // 2 if btn_cols else cw // 2)
         results.append((cx, y_offset + (bs + be) // 2))
     return results
@@ -538,8 +556,8 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
          (handles left-panel + right-answers layouts)
     """
     w, h   = img.size
-    x0, y0 = int(w * .03), int(h * .20)
-    x1, y1 = int(w * .97), int(h * .92)
+    x0, y0 = int(w * .03), int(h * .15)
+    x1, y1 = int(w * .97), int(h * .95)
     crop   = img.crop((x0, y0, x1, y1))
     cw, ch = crop.size
     step   = max(1, cw // 120)
