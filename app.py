@@ -492,56 +492,93 @@ def _best_button_group(
     return best_group
 
 
-def _scan_for_buttons(
-    img_crop,          # already-converted gray PIL image
-    pixels,
-    cw: int, ch: int,
-    x_offset: int, y_offset: int,
-    step: int,
-) -> list[tuple[int, int]] | None:
-    """
-    Run the full luminosity scan on a crop and return (cx, cy) list in
-    *original image* coordinates, or None if no good group found.
+def _find_bands_above(values: list[float], threshold: float,
+                      min_h: int, max_h: int) -> list[tuple[int, int]]:
+    """Find (start, end) of bands where value EXCEEDS threshold (absolute)."""
+    bands: list[tuple[int, int]] = []
+    in_band, band_start = False, 0
+    for y, val in enumerate(values):
+        if val > threshold and not in_band:
+            in_band, band_start = True, y
+        elif val <= threshold and in_band:
+            in_band = False
+            if min_h <= y - band_start <= max_h:
+                bands.append((band_start, y))
+    if in_band and min_h <= len(values) - band_start <= max_h:
+        bands.append((band_start, len(values)))
+    return bands
 
-    Two-pass: first with a normal threshold, then with a looser one if the
-    first pass found fewer than 3 bands (catches subtle low-contrast buttons).
-    The spacing-consistency filter rejects false positives from both passes.
+
+def _lum_scan(pixels, cw: int, ch: int,
+              x_offset: int, y_offset: int, step: int,
+              min_h: int, max_h: int) -> list[tuple[int, int]] | None:
     """
-    row_avg    = _row_avgs(pixels, cw, ch, step)
-    smoothed   = _smooth(row_avg, k=6)
+    Luminosity-deviation scan: find bands whose row-average luminosity
+    differs from the image mean. Works well for high-contrast buttons
+    (light buttons on dark bg, or dark buttons on light bg).
+    """
+    smoothed   = _smooth(_row_avgs(pixels, cw, ch, step), k=6)
     global_avg = sum(smoothed) / len(smoothed)
-    variance   = sum((v - global_avg) ** 2 for v in smoothed) / len(smoothed)
-    std        = variance ** 0.5
+    std        = (sum((v - global_avg) ** 2 for v in smoothed) / len(smoothed)) ** 0.5
 
-    min_h = max(12, int(ch * .02))
-    max_h = int(ch * .18)
+    for thr in (max(8.0, std * 0.55), max(5.0, std * 0.35)):
+        bands = _find_bands(smoothed, global_avg, thr, min_h, max_h)
+        group = _best_button_group(bands)
+        if group and len(group) >= 2:
+            results = []
+            for bs, be in group:
+                mid_y    = (bs + be) // 2
+                btn_cols = [x for x in range(0, cw, step)
+                            if abs(pixels[x, mid_y] - global_avg) > thr]
+                cx = x_offset + ((min(btn_cols) + max(btn_cols)) // 2
+                                 if btn_cols else cw // 2)
+                results.append((cx, y_offset + (bs + be) // 2))
+            return results
+    return None
 
-    # Pass 1 — normal sensitivity
-    thr1  = max(8.0, std * 0.55)
-    bands = _find_bands(smoothed, global_avg, thr1, min_h, max_h)
-    group = _best_button_group(bands)
 
-    # Pass 2 — lower threshold if we didn't find enough
-    if (group is None or len(group) < 3) and std > 0:
-        thr2   = max(5.0, std * 0.35)
-        bands2 = _find_bands(smoothed, global_avg, thr2, min_h, max_h)
-        group2 = _best_button_group(bands2)
-        # Accept pass-2 result only if it found more buttons
-        if group2 is not None and (group is None or len(group2) > len(group)):
-            group  = group2
-            thr1   = thr2   # use same threshold for col detection below
+def _range_scan(pixels, cw: int, ch: int,
+                x_offset: int, y_offset: int, step: int,
+                min_h: int, max_h: int) -> list[tuple[int, int]] | None:
+    """
+    Row-range scan: detect bands by within-row contrast (max-min luminosity).
 
-    if group is None:
+    Buttons with white text on a dark background create a large within-row
+    contrast spike (dark bg pixels vs white text pixels in the same row) even
+    when the button's average luminosity barely differs from the background.
+    This catches the low-contrast buttons that _lum_scan misses.
+    """
+    row_range = []
+    for y in range(ch):
+        vals = [pixels[x, y] for x in range(0, cw, step)]
+        row_range.append(max(vals) - min(vals))
+
+    smoothed = _smooth(row_range, k=3)
+    avg_rng  = sum(smoothed) / len(smoothed)
+    std_rng  = (sum((v - avg_rng) ** 2 for v in smoothed) / len(smoothed)) ** 0.5
+    # Only fire on rows with clearly-above-average within-row contrast
+    thr = max(18.0, avg_rng + 0.7 * std_rng)
+
+    bands = _find_bands_above(smoothed, thr, min_h, max_h)
+    group = _best_button_group(bands, min_score=0.60)
+    if group is None or len(group) < 2:
         return None
 
-    results: list[tuple[int, int]] = []
+    results = []
     for bs, be in group:
-        mid_y    = (bs + be) // 2
-        btn_cols = [x for x in range(0, cw, step)
-                    if abs(pixels[x, mid_y] - global_avg) > thr1]
-        cx = x_offset + ((min(btn_cols) + max(btn_cols)) // 2 if btn_cols else cw // 2)
+        mid_y = (bs + be) // 2
+        # Columns with bright pixels (text / radio-circle highlight) → button x-centre
+        bright_cols = [x for x in range(0, cw, step) if pixels[x, mid_y] > 60]
+        cx = x_offset + ((min(bright_cols) + max(bright_cols)) // 2
+                         if bright_cols else cw // 2)
         results.append((cx, y_offset + (bs + be) // 2))
     return results
+
+
+def _best_result(*candidates) -> list[tuple[int, int]] | None:
+    """Return the candidate with the most detected buttons (≥2), or None."""
+    valid = [r for r in candidates if r and len(r) >= 2]
+    return max(valid, key=len) if valid else None
 
 
 def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
@@ -550,10 +587,10 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
     coordinates (physical pixels), or None.
 
     Strategy:
-      1. Full-width scan (skip thin edges + taskbar area)
-      2. Score all windows of 2–4 consecutive bands by spacing consistency
-      3. If all centres land in the left half, re-scan right 50% only
-         (handles left-panel + right-answers layouts)
+      1. Full-width luminosity scan
+      2. If all centres land in the left half (reading panel), rescan right 50%
+      3. For the right-side scan, run BOTH luminosity and range-based detection
+         and pick whichever finds more buttons
     """
     w, h   = img.size
     x0, y0 = int(w * .03), int(h * .15)
@@ -564,22 +601,32 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
 
     blurred = crop.filter(ImageFilter.GaussianBlur(radius=3))
     gray    = blurred.convert("L")
-    pixels  = gray.load()
+    pix     = gray.load()
 
-    results = _scan_for_buttons(gray, pixels, cw, ch, x0, y0, step)
+    min_h = max(12, int(ch * .02))
+    max_h = int(ch * .20)
 
-    # Left-panel guard: if every centre is in the left half of the *full* image,
-    # the scan grabbed a reading passage — rescan right 50% only.
-    if results and all(cx < w * 0.50 for cx, _ in results):
-        x0b    = int(w * .50)
-        crop_r = img.crop((x0b, y0, x1, y1)).filter(ImageFilter.GaussianBlur(radius=3))
-        gray_r = crop_r.convert("L")
-        pix_r  = gray_r.load()
-        cwr    = x1 - x0b
-        step_r = max(1, cwr // 120)
-        results = _scan_for_buttons(gray_r, pix_r, cwr, ch, x0b, y0, step_r)
+    full_result = _lum_scan(pix, cw, ch, x0, y0, step, min_h, max_h)
 
-    return results
+    # If full scan put everything in the left half, it caught the reading card.
+    # Rescan right 50% using both strategies and take the better result.
+    if full_result is None or all(cx < w * 0.50 for cx, _ in full_result):
+        xR     = int(w * .50)
+        cropR  = img.crop((xR, y0, x1, y1)).filter(ImageFilter.GaussianBlur(radius=3))
+        grayR  = cropR.convert("L")
+        pixR   = grayR.load()
+        cwR    = x1 - xR
+        stepR  = max(1, cwR // 80)
+        chR    = ch   # same height
+
+        r_lum = _lum_scan  (pixR, cwR, chR, xR, y0, stepR, min_h, max_h)
+        r_rng = _range_scan(pixR, cwR, chR, xR, y0, stepR, min_h, max_h)
+        return _best_result(r_lum, r_rng)
+
+    # Full-scan result landed in the right half — also try range scan to see
+    # if it finds more buttons than the luminosity scan did.
+    r_rng = _range_scan(pix, cw, ch, x0, y0, step, min_h, max_h)
+    return _best_result(full_result, r_rng)
 
 
 def detect_input_field(img: Image.Image) -> tuple[int, int] | None:
