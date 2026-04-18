@@ -350,11 +350,12 @@ def parse_answer_response(raw: str) -> dict:
     # 4. Multiple-choice prose fallbacks
     patterns = [
         r'"answer"\s*:\s*([1-4])',
-        r'\*{0,2}[Aa]nswer\*{0,2}\s*:\s*([1-4])',      # *Answer*: 2  or  Answer: 2
+        r'\*{0,2}[Aa]nswer\*{0,2}\s*:\*{0,2}\s*([1-4])',   # **Answer:** 1 / *Answer*: 2
         r'(?:correct\s+answer|answer\s+is)\D{0,10}([1-4])\b',
         r'\bOption\s+([1-4])\b',
         r'^\*{0,2}([1-4])[.\)]\s',
         r'\b([1-4])\s+is\s+(?:correct|the\s+answer)',
+        r'[Aa]nswer[\*\s:]{0,12}([1-4])\b',               # loose catch-all
     ]
     for pat in patterns:
         m = re.search(pat, raw, re.IGNORECASE | re.MULTILINE)
@@ -587,46 +588,54 @@ def detect_buttons(img: Image.Image) -> list[tuple[int, int]] | None:
     coordinates (physical pixels), or None.
 
     Strategy:
-      1. Full-width luminosity scan
-      2. If all centres land in the left half (reading panel), rescan right 50%
-      3. For the right-side scan, run BOTH luminosity and range-based detection
-         and pick whichever finds more buttons
+      1. Scan right 60% first — this excludes the reading card that would
+         otherwise inflate std and raise the detection threshold.
+         In right-only mode, subtle dark-on-dark buttons have enough contrast
+         vs the uniform dark background to be reliably found.
+      2. If that finds nothing, scan full width (centred quiz layouts).
+
+    Each scan runs BOTH luminosity-deviation and row-range strategies;
+    the one that finds more buttons wins.
+
+    Row-range strategy uses a lower min_h (12 px absolute) because it
+    detects bands based on WHERE TEXT IS — just the text rows, which are
+    narrower than the full button height.
     """
-    w, h   = img.size
-    x0, y0 = int(w * .03), int(h * .15)
-    x1, y1 = int(w * .97), int(h * .95)
-    crop   = img.crop((x0, y0, x1, y1))
-    cw, ch = crop.size
-    step   = max(1, cw // 120)
+    w, h = img.size
+    y0   = int(h * .15)
+    y1   = int(h * .95)
+    ch   = y1 - y0
+    x1   = int(w * .97)
 
-    blurred = crop.filter(ImageFilter.GaussianBlur(radius=3))
-    gray    = blurred.convert("L")
-    pix     = gray.load()
+    # Luminosity scan: bands must be as tall as a whole button (~2-20% of crop)
+    lum_min_h = max(12, int(ch * .02))
+    lum_max_h = int(ch * .22)
+    # Range scan: narrower bands OK (only the text rows fire)
+    rng_min_h = 10
+    rng_max_h = int(ch * .22)
 
-    min_h = max(12, int(ch * .02))
-    max_h = int(ch * .20)
-
-    full_result = _lum_scan(pix, cw, ch, x0, y0, step, min_h, max_h)
-
-    # If full scan put everything in the left half, it caught the reading card.
-    # Rescan right 50% using both strategies and take the better result.
-    if full_result is None or all(cx < w * 0.50 for cx, _ in full_result):
-        xR     = int(w * .50)
-        cropR  = img.crop((xR, y0, x1, y1)).filter(ImageFilter.GaussianBlur(radius=3))
-        grayR  = cropR.convert("L")
-        pixR   = grayR.load()
-        cwR    = x1 - xR
-        stepR  = max(1, cwR // 80)
-        chR    = ch   # same height
-
-        r_lum = _lum_scan  (pixR, cwR, chR, xR, y0, stepR, min_h, max_h)
-        r_rng = _range_scan(pixR, cwR, chR, xR, y0, stepR, min_h, max_h)
+    def _scan(x_from: int) -> list[tuple[int, int]] | None:
+        cw    = x1 - x_from
+        step  = max(1, cw // 80)
+        pix   = (img.crop((x_from, y0, x1, y1))
+                    .filter(ImageFilter.GaussianBlur(radius=3))
+                    .convert("L").load())
+        r_lum = _lum_scan  (pix, cw, ch, x_from, y0, step, lum_min_h, lum_max_h)
+        r_rng = _range_scan(pix, cw, ch, x_from, y0, step, rng_min_h, rng_max_h)
         return _best_result(r_lum, r_rng)
 
-    # Full-scan result landed in the right half — also try range scan to see
-    # if it finds more buttons than the luminosity scan did.
-    r_rng = _range_scan(pix, cw, ch, x0, y0, step, min_h, max_h)
-    return _best_result(full_result, r_rng)
+    # Pass 1 — right 60% (handles card-on-left layouts, low-contrast buttons)
+    result = _scan(int(w * .40))
+    if result:
+        return result
+
+    # Pass 2 — full width (handles centred button layouts)
+    result = _scan(int(w * .03))
+    # Reject if everything landed in the card area (left 40%)
+    if result and not all(cx < w * .40 for cx, _ in result):
+        return result
+
+    return None
 
 
 def detect_input_field(img: Image.Image) -> tuple[int, int] | None:
